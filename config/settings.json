@@ -1,0 +1,9 @@
+{
+  "default_image": "assets/images/orientacion.png",
+  "custom_kernel": [[0, -1, 0], [-1, 5, -1], [0, -1, 0]],
+  "sigma": 2.0,
+  "canny_sigma": 1.4,
+  "alpha": 1.0,
+  "canny_high": 0.3,
+  "canny_low_ratio": 0.4
+}

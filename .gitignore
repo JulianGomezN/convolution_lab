@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+results/*
+!results/.gitkeep
+
+# Artefactos internos de los agentes (logs, capturas de verificación, revisiones)
+.agents/

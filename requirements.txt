@@ -1,0 +1,4 @@
+moderngl==5.13.0
+glfw==2.10.2
+pillow==12.3.0
+numpy==2.2.6

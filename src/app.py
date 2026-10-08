@@ -1,0 +1,315 @@
+"""Ventana GLFW, contexto OpenGL 3.3 core y bucle principal.
+
+Es el único módulo que importa glfw (D1). El procesado lo hace el Processor
+(entrada RGBA8 → target RGBA32F) y display.frag lo lleva a la pantalla con el
+mapeo de visualización. El teclado se traduce a las teclas de state.py.
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+import glfw
+import moderngl
+
+from src import kernels, state as st
+from src.config import SETTINGS_PATH, ConfigError, SettingsWatcher, load_settings
+from src.framebuffers import RenderTarget
+from src.pipeline import Processor
+from src.render_pass import Quad, run_pass
+from src.shader_loader import load_program
+from src.texture_loader import ImageLoadError, create_texture, load_image
+
+APP_NAME = st.APP_NAME
+# Con este tiempo de espera la vigilancia del mtime responde en < 1 s (R7.3).
+WAIT_TIMEOUT_S = 0.25
+
+# Códigos de GLFW → teclas de state.py. Fila de números y teclado numérico.
+KEY_MAP = {
+    **{getattr(glfw, f"KEY_{d}"): str(d) for d in range(10)},
+    **{getattr(glfw, f"KEY_KP_{d}"): str(d) for d in range(10)},
+    glfw.KEY_B: st.KEY_B,
+    glfw.KEY_N: st.KEY_N,
+    glfw.KEY_V: st.KEY_V,
+    glfw.KEY_R: st.KEY_R,
+    glfw.KEY_H: st.KEY_H,
+    glfw.KEY_M: st.KEY_M,
+    glfw.KEY_X: st.KEY_X,
+    glfw.KEY_C: st.KEY_C,
+    glfw.KEY_UP: st.KEY_UP,
+    glfw.KEY_DOWN: st.KEY_DOWN,
+    glfw.KEY_LEFT: st.KEY_LEFT,
+    glfw.KEY_RIGHT: st.KEY_RIGHT,
+    glfw.KEY_PAGE_UP: st.KEY_PAGE_UP,
+    glfw.KEY_PAGE_DOWN: st.KEY_PAGE_DOWN,
+    glfw.KEY_ESCAPE: st.KEY_ESCAPE,
+}
+
+# Campos de Settings → campos de AppState que se toman de settings.json.
+SETTINGS_TO_STATE = {
+    "custom_kernel": "custom_kernel",
+    "sigma": "sigma",
+    "canny_sigma": "canny_sigma",
+    "canny_high": "high",
+    "canny_low_ratio": "low_ratio",
+}
+
+GL_CAUSES = (
+    "Causas probables:\n"
+    "  - Driver de la GPU ausente o desactualizado (instala el del fabricante: NVIDIA, AMD o Intel).\n"
+    "  - Sesión de Escritorio Remoto (RDP), que puede ofrecer solo OpenGL 1.1.\n"
+    "  - Se está usando el «Adaptador de pantalla básico de Microsoft» en lugar del driver real."
+)
+
+
+class GLContextError(Exception):
+    """GLFW no se inicia, la ventana no se crea o OpenGL < 3.3 (código de salida 3)."""
+
+
+def _warn(msg: str) -> None:
+    print(f"Aviso: {msg}", file=sys.stderr)
+
+
+class App:
+    def __init__(self, image, image_path: Path, settings_path: Path = SETTINGS_PATH):
+        self.image = image
+        self.image_path = Path(image_path)
+        self.height, self.width = image.shape[:2]
+        self.size = (self.width, self.height)
+        self.window = None
+        self.ctx = None
+        self.last_glfw_error = None
+        self._resources = []  # objetos GL a liberar en orden inverso
+        self.settings_path = Path(settings_path)
+        self.watcher = SettingsWatcher(self.settings_path)
+        try:
+            self.settings = load_settings(self.settings_path)
+        except ConfigError as exc:
+            _warn(
+                f"{exc}\nSe usa la identidad como kernel personalizado y los valores por defecto "
+                "de σ y umbrales hasta que se corrija (tecla R)."
+            )
+            self.settings = None
+            self.state = st.AppState(custom_kernel=kernels.IDENTITY)
+        else:
+            self.state = st.AppState(
+                **{field: getattr(self.settings, key) for key, field in SETTINGS_TO_STATE.items()}
+            )
+
+    # --- inicialización -------------------------------------------------
+
+    def _on_glfw_error(self, code, description):
+        if isinstance(description, bytes):
+            description = description.decode("utf-8", "replace")
+        self.last_glfw_error = f"({code}) {description}"
+        print(f"[GLFW] error {self.last_glfw_error}", file=sys.stderr)
+
+    def _gl_error(self, what: str) -> GLContextError:
+        detail = f"\nDetalle de GLFW: {self.last_glfw_error}" if self.last_glfw_error else ""
+        return GLContextError(f"{what}{detail}\n{GL_CAUSES}")
+
+    def init(self) -> None:
+        glfw.set_error_callback(self._on_glfw_error)
+        if not glfw.init():
+            raise self._gl_error("No se pudo inicializar GLFW.")
+
+        # Contexto 3.3 core forward-compatible (R1.1); ventana fija W×H (R3.1).
+        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+        glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, True)
+        glfw.window_hint(glfw.RESIZABLE, False)
+        glfw.window_hint(glfw.SCALE_TO_MONITOR, False)  # sin reescalado por DPI
+        glfw.window_hint(glfw.VISIBLE, False)  # se muestra tras validar tamaños
+
+        self.window = glfw.create_window(self.width, self.height, APP_NAME, None, None)
+        if not self.window:
+            raise self._gl_error("No se pudo crear la ventana con un contexto OpenGL 3.3 core.")
+        glfw.make_context_current(self.window)
+        glfw.swap_interval(1)
+
+        try:
+            self.ctx = moderngl.create_context(require=330)
+        except Exception as exc:  # noqa: BLE001 - moderngl no unifica sus excepciones
+            raise self._gl_error(f"No se pudo crear el contexto moderngl con OpenGL 3.3: {exc}") from None
+        if self.ctx.version_code < 330:
+            raise self._gl_error(f"Se requiere OpenGL 3.3 y el contexto ofrece {self.ctx.version_code}.")
+
+        info = self.ctx.info
+        print(f"GL_VERSION:  {info['GL_VERSION']}")
+        print(f"GL_RENDERER: {info['GL_RENDERER']}")
+        print(f"GL_VENDOR:   {info['GL_VENDOR']}")
+
+        self._check_sizes(info["GL_MAX_TEXTURE_SIZE"])
+        self._create_gl_objects()
+
+        glfw.set_key_callback(self.window, self._on_key)
+        # Sin esto, Windows deja la ventana en negro tras minimizarla o taparla.
+        glfw.set_window_refresh_callback(self.window, self._on_refresh)
+        glfw.set_window_title(self.window, self._title())
+        glfw.show_window(self.window)
+        print("Pulsa H para ver los controles.")
+        print(st.kernel_report(self.state))
+
+    def _check_sizes(self, max_texture_size: int) -> None:
+        w, h = self.size
+        if w > max_texture_size or h > max_texture_size:
+            raise ImageLoadError(
+                self.image_path,
+                f"la imagen mide {w}x{h} y supera GL_MAX_TEXTURE_SIZE ({max_texture_size}) de esta GPU",
+            )
+        monitor = glfw.get_primary_monitor()
+        if monitor:
+            _, _, mw, mh = glfw.get_monitor_workarea(monitor)
+            if w > mw or h > mh:
+                _warn(
+                    f"la imagen ({w}x{h}) es mayor que el área de trabajo del monitor ({mw}x{mh}); "
+                    "no se reescala, parte de la ventana puede quedar fuera de la pantalla."
+                )
+        fw, fh = glfw.get_framebuffer_size(self.window)
+        print(f"imagen {w}x{h} | framebuffer {fw}x{fh}")
+        if (fw, fh) != (w, h):
+            _warn(
+                f"el framebuffer ({fw}x{fh}) no coincide con la imagen ({w}x{h}); "
+                f"se sigue dibujando con viewport {w}x{h}, sin reescalar."
+            )
+
+    def _create_gl_objects(self) -> None:
+        ctx = self.ctx
+        self.quad = self._keep(Quad(ctx))
+        self.prog_display = self._keep(load_program(ctx, "display.frag"))
+        self.input_tex = self._keep(create_texture(ctx, self.image))
+        self.processor = self._keep(Processor(ctx, self.quad, self.input_tex))
+        self.screen = RenderTarget.screen(ctx, self.size)
+
+    def _keep(self, obj):
+        self._resources.append(obj)
+        return obj
+
+    # --- callbacks ------------------------------------------------------
+
+    def _on_key(self, window, key, scancode, action, mods):
+        mapped = KEY_MAP.get(key)
+        if mapped is None:
+            return  # tecla sin asignar (R16.5)
+        # Flechas y RePág/AvPág también responden a la autorrepetición.
+        if action == glfw.PRESS or (action == glfw.REPEAT and mapped in st.REPEAT_KEYS):
+            self.apply_key(mapped)
+
+    def apply_key(self, key: str) -> None:
+        """Aplica una tecla de state.py: nuevo estado, acción, consola y título."""
+        if key == kernels.CUSTOM_KEY and self.watcher.changed():
+            # El archivo cambió mientras el kernel personalizado no estaba activo.
+            self.reload_settings()
+        old = self.state
+        new, action = st.handle_key(old, key)
+        self._set_state(new, old)
+        if action == st.ACTION_QUIT:
+            glfw.set_window_should_close(self.window, True)
+        elif action == st.ACTION_HELP:
+            print(st.HELP_TEXT)
+        elif action == st.ACTION_RELOAD:
+            self.reload_settings()
+
+    def _set_state(self, new: st.AppState, old: st.AppState) -> None:
+        if new is old:
+            return
+        self.state = new
+        if (new.kernel_id, new.normalize) != (old.kernel_id, old.normalize) or (
+            new.kernel_id == kernels.CUSTOM_KEY and new.custom_kernel != old.custom_kernel
+        ):
+            print(st.kernel_report(new))  # R6.3
+        glfw.set_window_title(self.window, self._title())
+
+    def reload_settings(self) -> bool:
+        """Recarga settings.json. Si no es válido, conserva la configuración anterior (R7.4)."""
+        self.watcher.changed()  # sincroniza el mtime para no recargar dos veces
+        try:
+            settings = load_settings(self.settings_path)
+        except ConfigError as exc:
+            print(f"Error en la configuración: {exc}\nSe conserva la configuración anterior.", file=sys.stderr)
+            return False
+        print(f"Configuración recargada de {self.settings_path}.")
+        # Solo se aplican las claves que cambiaron en el archivo: así no se pierden
+        # los ajustes hechos con el teclado (σ, umbral) al editar otra clave.
+        prev, self.settings = self.settings, settings
+        old = self.state
+        changes = {}
+        for key, field in SETTINGS_TO_STATE.items():
+            value = getattr(settings, key)
+            if (prev is None or value != getattr(prev, key)) and value != getattr(old, field):
+                changes[field] = value
+        if changes:
+            self._set_state(replace(old, **changes, dirty=True), old)
+        return True
+
+    def poll_settings(self) -> None:
+        """Con el kernel personalizado activo, recarga si cambió el archivo (R7.3)."""
+        if self.state.kernel_id == kernels.CUSTOM_KEY and self.watcher.changed():
+            self.reload_settings()
+
+    def _on_refresh(self, window):
+        self.state = replace(self.state, dirty=True)
+
+    # --- render ---------------------------------------------------------
+
+    def _title(self) -> str:
+        return st.title(self.state, self.image_path.name, self.size)
+
+    def render(self) -> bool:
+        fw, fh = glfw.get_framebuffer_size(self.window)
+        if fw == 0 or fh == 0:  # ventana minimizada: no se dibuja
+            return False
+        tex, view = self.processor.run(self.state)
+        # Se limpia todo el framebuffer por si es mayor que W×H; luego viewport W×H.
+        self.ctx.screen.use()
+        self.ctx.viewport = (0, 0, fw, fh)
+        self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+        run_pass(
+            self.quad,
+            self.prog_display,
+            self.screen,
+            {"u_src": tex},
+            {"u_flip_y": 1, "u_channel": view.channel, "u_map": view.map, "u_gain": view.gain},
+        )
+        glfw.swap_buffers(self.window)
+        return True
+
+    def loop(self) -> None:
+        while not glfw.window_should_close(self.window):
+            # Render bajo demanda (S12): espera eventos sin gastar CPU ni GPU.
+            glfw.wait_events_timeout(WAIT_TIMEOUT_S)
+            self.poll_settings()
+            if self.state.dirty and self.render():
+                self.state = replace(self.state, dirty=False)
+
+    # --- liberación -----------------------------------------------------
+
+    def release(self) -> None:
+        for obj in reversed(self._resources):
+            try:
+                obj.release()
+            except Exception:  # noqa: BLE001 - liberar lo posible al salir
+                pass
+        self._resources.clear()
+        if self.ctx is not None:
+            self.ctx.release()
+            self.ctx = None
+        if self.window:
+            glfw.destroy_window(self.window)
+            self.window = None
+        glfw.terminate()
+
+
+def run(image_path) -> int:
+    """Carga la imagen (antes de crear la ventana, R4.3), abre la ventana y ejecuta el bucle."""
+    image = load_image(image_path)
+    app = App(image, Path(image_path))
+    try:
+        app.init()
+        app.loop()
+    finally:
+        app.release()
+    return 0
