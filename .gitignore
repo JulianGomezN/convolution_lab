@@ -7,3 +7,6 @@ results/*
 
 # Artefactos internos de los agentes (logs, capturas de verificación, revisiones)
 .agents/
+
+# Documentacion de Kiro
+.kiro/
