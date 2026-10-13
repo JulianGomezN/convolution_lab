@@ -22,6 +22,9 @@ KEY_H = "H"
 KEY_M = "M"
 KEY_X = "X"
 KEY_C = "C"
+KEY_S = "S"
+KEY_G = "G"
+KEY_P = "P"
 KEY_UP = "UP"
 KEY_DOWN = "DOWN"
 KEY_LEFT = "LEFT"
@@ -36,14 +39,24 @@ REPEAT_KEYS = frozenset({KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_PAGE_UP, KEY
 ACTION_RELOAD = "reload"
 ACTION_HELP = "help"
 ACTION_QUIT = "quit"
+ACTION_CAPTURE = "capture"
+ACTION_BENCHMARK = "benchmark"
 
 # --- modos --------------------------------------------------------------
 MODE_KERNEL = "kernel"
 MODE_BLUR = "blur"
+MODE_UNSHARP = "unsharp"
 MODE_CANNY = "canny"
-MODE_NAMES = {MODE_KERNEL: "Kernel", MODE_BLUR: "Desenfoque", MODE_CANNY: "Canny"}
-# Ciclo de la tecla M (R11.1). La tarea 18 añade Unsharp después de Desenfoque.
-MODE_CYCLE = (MODE_KERNEL, MODE_BLUR)
+MODE_NAMES = {MODE_KERNEL: "Kernel", MODE_BLUR: "Desenfoque", MODE_UNSHARP: "Unsharp", MODE_CANNY: "Canny"}
+# Ciclo de la tecla M (R11.1).
+MODE_CYCLE = (MODE_KERNEL, MODE_BLUR, MODE_UNSHARP)
+# Modos que desenfocan: responden a Arriba/Abajo (σ) y a S (2D/separable) (R11.2, R14.1).
+BLUR_MODES = frozenset({MODE_BLUR, MODE_UNSHARP, MODE_CANNY})
+# Gaussiano 2D directo o separable (R14.1), para el título.
+METHOD_SEPARABLE, METHOD_2D = "separable", "2D"
+
+# --- unsharp (R13.2) ------------------------------------------------------
+ALPHA_STEP, ALPHA_MIN, ALPHA_MAX = 0.25, 0.0, 5.0
 
 # --- bordes (u_border, R10.1) --------------------------------------------
 BORDER_ZERO, BORDER_REPLICATE, BORDER_REFLECT, BORDER_WRAP = 0, 1, 2, 3
@@ -68,13 +81,17 @@ Controles:
   B        modo de borde: zero -> replicate -> reflect -> wrap
   N        activar/desactivar la normalización (dividir por la suma)
   V        mapeo de visualización (modo Kernel): recorte -> |v| -> offset 0.5+0.5v
-  M        modo: Kernel -> Desenfoque
+  M        modo: Kernel -> Desenfoque -> Unsharp
   X        perfil de desenfoque: gaussiano / box de varianza equivalente
   Arriba/Abajo    sigma del desenfoque (en Canny, sigma del gaussiano de Canny)
+  S        desenfoque 2D directo / separable (Desenfoque, Unsharp y Canny)
   C        activar/desactivar el pipeline Canny (al salir vuelve al modo anterior)
   Izquierda/Derecha  etapa de Canny: Original, Gris, Blur H, Blur, Gx, Gy,
            Magnitud, Dirección, NMS, Clasificación, Bordes
-  RePág/AvPág     umbral alto de Canny (+/- 0.05; bajo = ratio · alto)
+  RePág/AvPág     alfa de Unsharp (+/- 0.25) o umbral alto de Canny
+                  (+/- 0.05; bajo = ratio · alto)
+  G        guardar captura del resultado en results/
+  P        benchmark: gaussiano 2D directo frente a separable (CSV en results/)
   R        recargar config/settings.json
   H        mostrar esta ayuda
   Esc      salir
@@ -92,6 +109,8 @@ class AppState:
     sigma: float = 2.0  # modo Desenfoque (R11.2)
     canny_sigma: float = 1.4  # gaussiano de Canny (R12.7)
     profile: str = kernels.PROFILE_GAUSS  # perfil del modo Desenfoque (R11.3)
+    separable: bool = True  # False: desenfoque 2D directo con blur_2d.frag (R14.1)
+    alpha: float = 1.0  # unsharp: orig + α·(orig − blur) (R13.2)
     prev_mode: str = MODE_KERNEL  # modo al que vuelve C (R12.1)
     stage: int = 1  # etapa visible de Canny, 1..11; se conserva al salir y volver
     high: float = 0.3  # umbral alto sobre |G|/4 (S7: tras el gaussiano σ=1.4 un escalón ideal da ≈ 0.51)
@@ -165,11 +184,15 @@ def handle_key(state: AppState, key) -> tuple[AppState, str | None]:
         delta = kernels.SIGMA_STEP if key == KEY_UP else -kernels.SIGMA_STEP
         if state.mode == MODE_CANNY:
             new = replace(state, canny_sigma=_step_sigma(state.canny_sigma, delta))
-        elif state.mode == MODE_BLUR:
+        elif state.mode in (MODE_BLUR, MODE_UNSHARP):
             new = replace(state, sigma=_step_sigma(state.sigma, delta))
         else:
             return state, None  # el modo Kernel no desenfoca
         return (state, None) if new == state else (replace(new, dirty=True), None)
+    if key == KEY_S:
+        if state.mode not in BLUR_MODES:
+            return state, None  # el modo Kernel no desenfoca
+        return replace(state, separable=not state.separable, dirty=True), None
     if key == KEY_C:
         if state.mode == MODE_CANNY:
             return replace(state, mode=state.prev_mode, dirty=True), None
@@ -180,11 +203,18 @@ def handle_key(state: AppState, key) -> tuple[AppState, str | None]:
         stage = min(STAGE_COUNT, max(1, state.stage + (1 if key == KEY_RIGHT else -1)))
         return (state, None) if stage == state.stage else (replace(state, stage=stage, dirty=True), None)
     if key in (KEY_PAGE_UP, KEY_PAGE_DOWN):
+        sign = 1 if key == KEY_PAGE_UP else -1
+        if state.mode == MODE_UNSHARP:
+            alpha = round(min(ALPHA_MAX, max(ALPHA_MIN, state.alpha + sign * ALPHA_STEP)), 4)
+            return (state, None) if alpha == state.alpha else (replace(state, alpha=alpha, dirty=True), None)
         if state.mode != MODE_CANNY:
-            return state, None  # la tarea 18 añade α en modo Unsharp
-        delta = HIGH_STEP if key == KEY_PAGE_UP else -HIGH_STEP
-        high = round(min(HIGH_MAX, max(HIGH_MIN, state.high + delta)), 4)
+            return state, None
+        high = round(min(HIGH_MAX, max(HIGH_MIN, state.high + sign * HIGH_STEP)), 4)
         return (state, None) if high == state.high else (replace(state, high=high, dirty=True), None)
+    if key == KEY_G:
+        return state, ACTION_CAPTURE
+    if key == KEY_P:
+        return state, ACTION_BENCHMARK
     if key == KEY_R:
         return state, ACTION_RELOAD
     if key == KEY_H:
@@ -206,8 +236,20 @@ def blur_label(state: AppState) -> str:
     return f"{kernels.PROFILE_NAMES[state.profile]} σ={state.sigma:g} r={r}"
 
 
-def title(state: AppState, image_name: str, size: tuple[int, int]) -> str:
-    """Título de la ventana con el estado visible (R6.3, R9.4, R12.4, R16.3)."""
+def method_label(state: AppState) -> str:
+    return METHOD_SEPARABLE if state.separable else METHOD_2D
+
+
+def stage_label(state: AppState) -> str:
+    name = STAGE_NAMES[state.stage - 1]
+    if state.stage == 3 and not state.separable:
+        # En 2D no hay pasada horizontal aparte: se ve el desenfoque completo.
+        name += " (n/a en 2D)"
+    return name
+
+
+def title(state: AppState, image_name: str, size: tuple[int, int], gpu_ms: float | None = None) -> str:
+    """Título de la ventana con el estado visible (R6.3, R9.4, R12.4, R14.5, R16.3)."""
     w, h = size
     parts = [APP_NAME, f"{image_name} {w}x{h}"]
     border = f"Borde: {BORDER_NAMES[state.border]}"
@@ -219,15 +261,25 @@ def title(state: AppState, image_name: str, size: tuple[int, int]) -> str:
             f"Vista: {kernels.MAP_NAMES[state.display_map]}",
         ]
     elif state.mode == MODE_BLUR:
-        parts += [f"{MODE_NAMES[state.mode]}: {blur_label(state)}", border]
+        parts += [f"{MODE_NAMES[state.mode]}: {blur_label(state)}", border, method_label(state)]
+    elif state.mode == MODE_UNSHARP:
+        r = kernels.gaussian_radius(state.sigma)
+        parts += [
+            f"{MODE_NAMES[state.mode]}: α={state.alpha:.2f} gaussiano σ={state.sigma:g} r={r}",
+            border,
+            method_label(state),
+        ]
     else:
         r = kernels.gaussian_radius(state.canny_sigma)
         parts += [
-            f"Canny {state.stage}/{STAGE_COUNT}: {STAGE_NAMES[state.stage - 1]}",
+            f"Canny {state.stage}/{STAGE_COUNT}: {stage_label(state)}",
             border,
             f"σ={state.canny_sigma:g} r={r}",
             f"alto={state.high:.2f} bajo={state.low:.2f}",
+            method_label(state),
         ]
+    if gpu_ms is not None:
+        parts.append(f"GPU: {gpu_ms:.2f} ms")
     return " | ".join(parts)
 
 

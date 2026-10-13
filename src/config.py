@@ -34,17 +34,19 @@ NUMERIC_KEYS = {
     "canny_sigma": (1.4, 0.5, 10.0),
     "canny_high": (0.3, 0.05, 1.0),
     "canny_low_ratio": (0.4, 0.0, 1.0),
+    "alpha": (1.0, 0.0, 5.0),  # unsharp (R13.2)
 }
 
 
 @dataclass(frozen=True)
 class Settings:
     custom_kernel: tuple[float, ...]  # 9 pesos, fila superior primero
-    data: dict  # contenido completo; las demás claves se validan en fases posteriores
+    data: dict  # contenido completo (default_image lo lee main.py)
     sigma: float = NUMERIC_KEYS["sigma"][0]
     canny_sigma: float = NUMERIC_KEYS["canny_sigma"][0]
     canny_high: float = NUMERIC_KEYS["canny_high"][0]
     canny_low_ratio: float = NUMERIC_KEYS["canny_low_ratio"][0]
+    alpha: float = NUMERIC_KEYS["alpha"][0]
 
 
 def _is_number(v) -> bool:

@@ -22,7 +22,7 @@ def test_shaders_exist():
     names = {p.name for p in SHADERS}
     assert {
         "fullscreen.vert", "common.glsl", "convolve3x3.frag", "display.frag", "blur_1d.frag",
-        "grayscale.frag", "sobel.frag", "nms.frag", "threshold.frag",
+        "grayscale.frag", "sobel.frag", "nms.frag", "threshold.frag", "blur_2d.frag", "unsharp.frag",
     } <= names
 
 

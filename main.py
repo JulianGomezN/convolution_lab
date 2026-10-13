@@ -1,4 +1,4 @@
-"""Punto de entrada: python main.py [--image RUTA].
+"""Punto de entrada: python main.py [--image RUTA] [--benchmark | --experiments] [--quick].
 
 Códigos de salida: 0 normal, 1 error inesperado, 2 error de imagen,
 3 error de OpenGL/GLFW, 4 error de shader, 130 Ctrl+C.
@@ -42,6 +42,8 @@ _ARGPARSE_ES = {
     "unrecognized arguments: %s": "argumentos no reconocidos: %s",
     "expected one argument": "se esperaba un argumento",
     "the following arguments are required: %s": "faltan los argumentos obligatorios: %s",
+    "not allowed with argument %s": "no se permite junto con el argumento %s",
+    "argument %(argument_name)s: %(message)s": "argumento %(argument_name)s: %(message)s",
 }
 _argparse_gettext = argparse._
 argparse._ = lambda text: _ARGPARSE_ES.get(text, _argparse_gettext(text))
@@ -70,6 +72,23 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="RUTA",
         help="imagen a cargar (por defecto: default_image de config/settings.json)",
     )
+    batch = parser.add_mutually_exclusive_group()
+    batch.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="mide el gaussiano 2D directo frente al separable sin abrir ventana "
+        "y guarda results/benchmark_<fecha>.csv",
+    )
+    batch.add_argument(
+        "--experiments",
+        action="store_true",
+        help="genera los experimentos E1-E5 y manifest.csv en results/experimentos_<fecha>/",
+    )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="con --benchmark o --experiments: menos repeticiones del benchmark (1 de calentamiento y 5 medidas)",
+    )
     return parser
 
 
@@ -78,6 +97,10 @@ def main(argv: list[str] | None = None) -> int:
     image_path = Path(args.image) if args.image else default_image()
 
     try:
+        if args.benchmark:
+            return app.run_benchmark(image_path, quick=args.quick)
+        if args.experiments:
+            return app.run_experiments(image_path, quick=args.quick)
         return app.run(image_path)
     except ImageLoadError as exc:
         print(f"Error de imagen: {exc}", file=sys.stderr)

@@ -2,6 +2,7 @@
 
 import math
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,7 @@ import pytest
 
 from src import kernels
 from src.pipeline import Processor, View
-from src.state import MODE_BLUR, AppState
+from src.state import MODE_BLUR, MODE_CANNY, AppState
 from src.texture_loader import create_texture
 from tests.reference import NP_MODES, blur_separable
 
@@ -116,3 +117,53 @@ def test_blur_mode_matches_numpy(processor, source, profile, sigma, border):
     assert tex.dtype == "f4"
     assert view == View()
     assert processor.last_passes == ["blur H", "blur V"]
+
+
+# --- gaussiano 2D directo frente a separable (R14.1, R14.2) ------------------
+
+
+def _read(tex) -> np.ndarray:
+    w, h = tex.size
+    return np.frombuffer(tex.read(), dtype=np.float32).reshape(h, w, 4).copy()
+
+
+def test_blur_2d_declares_same_weights(processor):
+    assert processor.prog_blur_2d["u_weights"].array_length == kernels.MAX_TAPS
+
+
+@pytest.mark.parametrize("border", [0, 1, 2, 3], ids=lambda b: NP_MODES[b])
+@pytest.mark.parametrize("profile", ["gauss", "box"])
+@pytest.mark.parametrize("sigma", [0.5, 2.0, 10.0])  # σ = 10: r = 30, mayor que 7×5
+def test_blur_2d_matches_separable(processor, source, profile, sigma, border):
+    src, _ = source
+    state = AppState(mode=MODE_BLUR, profile=profile, sigma=sigma, border=border)
+    sep = _read(processor.run(state)[0])
+    tex, view = processor.run(replace(state, separable=False))
+    assert processor.last_passes == ["blur 2D"]  # una sola pasada, (2r+1)² lecturas
+    two_d = _read(tex)
+    assert np.max(np.abs(two_d[..., :3] - sep[..., :3])) <= 1e-4
+    expected = blur_separable(src[..., :3], kernels.blur_weights(profile, sigma), border)
+    assert np.max(np.abs(two_d[..., :3] - expected)) <= 1e-4
+    assert np.all(two_d[..., 3] == 1.0)
+    assert view == View() and tex.dtype == "f4" and tex.size == (W, H)
+
+
+@pytest.mark.parametrize("border", [0, 1, 2, 3], ids=lambda b: NP_MODES[b])
+def test_canny_2d_matches_separable(processor, border):
+    """S en Canny: el blur en 2D es una pasada; Sobel sobre él coincide con el separable."""
+    for stage in (3, 4, 5, 6, 7):
+        state = AppState(mode=MODE_CANNY, stage=stage, border=border, canny_sigma=1.4)
+        sep = _read(processor.run(state)[0])
+        two_d = _read(processor.run(replace(state, separable=False))[0])
+        expected = ["gris", "blur 2D"] + (["sobel"] if stage >= 5 else [])
+        assert processor.last_passes == expected
+        channels = slice(0, 3) if stage >= 5 else slice(0, 1)
+        if stage == 3:
+            # En 2D la etapa Blur H ya muestra el desenfoque completo (etapa 4 separable).
+            sep = _read(processor.run(replace(state, stage=4))[0])
+        assert np.max(np.abs(two_d[..., channels] - sep[..., channels])) <= 1e-4, stage
+
+
+def test_canny_2d_full_pipeline_passes(processor):
+    processor.run(AppState(mode=MODE_CANNY, stage=11, separable=False))
+    assert processor.last_passes == ["gris", "blur 2D", "sobel", "nms", "umbral"]

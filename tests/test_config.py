@@ -198,6 +198,21 @@ def test_key_map_covers_state_keys():
     assert {str(i) for i in range(9)} <= mapped
     assert {"B", "N", "V", "R", "H", "ESCAPE"} <= mapped
     assert {"M", "X", "C", "UP", "DOWN", "LEFT", "RIGHT", "PAGE_UP", "PAGE_DOWN"} <= mapped
+    assert {"S", "G", "P"} <= mapped
+
+
+def test_alpha_setting(tmp_path, make_app):
+    assert load_settings(SETTINGS_PATH).alpha == 1.0
+    p = _write(tmp_path / "s.json", {"custom_kernel": list(SHARPEN)})
+    assert load_settings(p).alpha == 1.0  # opcional
+    for bad in (-0.25, 5.5, "1"):
+        _write(p, {"custom_kernel": list(SHARPEN), "alpha": bad})
+        with pytest.raises(ConfigError, match="alpha"):
+            load_settings(p)
+    a, path = make_app(list(SHARPEN))
+    _write(path, {"custom_kernel": list(SHARPEN), "alpha": 2.5})
+    a = app_mod.App(np.zeros((5, 7, 4), np.uint8), tmp_path / "img.png", settings_path=path)
+    assert a.state.alpha == 2.5
 
 
 # --- σ y umbrales de Canny (R11.2, R12.7, R12.11) -------------------------------

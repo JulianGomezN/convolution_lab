@@ -137,7 +137,7 @@ def test_kernel_report_shows_effective_matrix_and_sum():
 
 def test_help_lists_controls():
     for token in ("1-8", "0", "B", "N", "V", "R", "H", "Esc", "M", "X", "C", "Arriba/Abajo",
-                  "Izquierda/Derecha", "RePág/AvPág"):
+                  "Izquierda/Derecha", "RePág/AvPág", "S ", "G ", "P ", "Unsharp", "2D"):
         assert token in st.HELP_TEXT
 
 
@@ -148,9 +148,11 @@ def _clean(**kw):
     return replace(AppState(**kw), dirty=False)
 
 
-def test_m_cycles_kernel_and_blur():
+def test_m_cycles_kernel_blur_unsharp():
     s, action = handle_key(_clean(), st.KEY_M)
     assert action is None and s.mode == st.MODE_BLUR and s.dirty
+    s, _ = handle_key(replace(s, dirty=False), st.KEY_M)
+    assert s.mode == st.MODE_UNSHARP and s.dirty
     s, _ = handle_key(replace(s, dirty=False), st.KEY_M)
     assert s.mode == st.MODE_KERNEL
 
@@ -308,13 +310,103 @@ def test_stage_names():
     )
 
 
+# --- 2D/separable, unsharp, captura y benchmark (R13, R14, R15) --------------
+
+
+@pytest.mark.parametrize("mode", [st.MODE_BLUR, st.MODE_UNSHARP, st.MODE_CANNY])
+def test_s_toggles_separable_in_blur_modes(mode):
+    s0 = _clean(mode=mode)
+    assert s0.separable is True  # separable por defecto
+    s1, action = handle_key(s0, st.KEY_S)
+    assert action is None and s1.separable is False and s1.dirty
+    assert s1.mode == mode
+    s2, _ = handle_key(replace(s1, dirty=False), st.KEY_S)
+    assert s2.separable is True
+
+
+def test_s_ignored_in_kernel_mode():
+    s = _clean()
+    assert handle_key(s, st.KEY_S)[0] is s
+
+
+def test_separable_survives_mode_changes():
+    s, _ = handle_key(_clean(mode=st.MODE_BLUR), st.KEY_S)
+    s, _ = handle_key(s, st.KEY_M)  # Unsharp
+    assert s.separable is False
+    s, _ = handle_key(s, st.KEY_C)  # Canny
+    assert s.separable is False
+
+
+def test_up_down_step_sigma_in_unsharp():
+    s = _clean(mode=st.MODE_UNSHARP, sigma=2.0)
+    s, _ = handle_key(s, st.KEY_UP)
+    assert s.sigma == 2.5 and s.dirty
+
+
+def test_page_keys_adjust_alpha_in_unsharp():
+    s = _clean(mode=st.MODE_UNSHARP)
+    assert s.alpha == 1.0  # por defecto (R13.2)
+    s, action = handle_key(s, st.KEY_PAGE_UP)
+    assert action is None and s.alpha == 1.25 and s.dirty
+    assert s.high == AppState().high  # no toca el umbral de Canny
+    s, _ = handle_key(replace(s, dirty=False), st.KEY_PAGE_DOWN)
+    s, _ = handle_key(s, st.KEY_PAGE_DOWN)
+    assert s.alpha == 0.75
+    for _ in range(30):
+        s, _ = handle_key(s, st.KEY_PAGE_DOWN)
+    assert s.alpha == st.ALPHA_MIN == 0.0
+    assert handle_key(s, st.KEY_PAGE_DOWN)[0] is s
+    for _ in range(30):
+        s, _ = handle_key(s, st.KEY_PAGE_UP)
+    assert s.alpha == st.ALPHA_MAX == 5.0
+    assert handle_key(s, st.KEY_PAGE_UP)[0] is s
+
+
+@pytest.mark.parametrize("key, action", [(st.KEY_G, st.ACTION_CAPTURE), (st.KEY_P, st.ACTION_BENCHMARK)])
+@pytest.mark.parametrize("mode", [st.MODE_KERNEL, st.MODE_BLUR, st.MODE_UNSHARP, st.MODE_CANNY])
+def test_capture_and_benchmark_actions(key, action, mode):
+    s0 = _clean(mode=mode)
+    s1, got = handle_key(s0, key)
+    assert got == action and s1 is s0
+
+
+def test_title_shows_method():
+    t = st.title(AppState(mode=st.MODE_BLUR), "a.png", (7, 5))
+    assert "| separable" in t
+    t = st.title(AppState(mode=st.MODE_BLUR, separable=False), "a.png", (7, 5))
+    assert "| 2D" in t
+    t = st.title(AppState(mode=st.MODE_CANNY, stage=7, separable=False), "a.png", (7, 5))
+    assert "| 2D" in t and "Canny 7/11: Magnitud" in t
+    assert "separable" not in st.title(AppState(), "a.png", (7, 5))  # el modo Kernel no desenfoca
+
+
+def test_title_blur_h_in_2d():
+    t = st.title(AppState(mode=st.MODE_CANNY, stage=3, separable=False), "a.png", (7, 5))
+    assert "Canny 3/11: Blur H (n/a en 2D)" in t
+    t = st.title(AppState(mode=st.MODE_CANNY, stage=3), "a.png", (7, 5))
+    assert "Canny 3/11: Blur H |" in t
+
+
+def test_title_unsharp():
+    t = st.title(AppState(mode=st.MODE_UNSHARP, alpha=1.5, sigma=2.0), "a.png", (7, 5))
+    assert "Unsharp: α=1.50 gaussiano σ=2 r=6" in t
+    assert "Borde: zero" in t and "separable" in t
+
+
+def test_title_gpu_time():
+    assert "GPU: 1.23 ms" in st.title(AppState(), "a.png", (7, 5), gpu_ms=1.234)
+    assert "GPU" not in st.title(AppState(), "a.png", (7, 5))
+
+
 def test_repeat_keys():
     assert st.REPEAT_KEYS == {
         st.KEY_UP, st.KEY_DOWN, st.KEY_LEFT, st.KEY_RIGHT, st.KEY_PAGE_UP, st.KEY_PAGE_DOWN
     }
 
 
-@pytest.mark.parametrize("module", ["state.py", "kernels.py", "config.py", "pipeline.py"])
+@pytest.mark.parametrize(
+    "module", ["state.py", "kernels.py", "config.py", "pipeline.py", "capture.py", "benchmark.py", "experiments.py"]
+)
 def test_core_modules_do_not_import_glfw(module):
     """Solo app.py importa glfw (D1)."""
     text = (ROOT / "src" / module).read_text(encoding="utf-8")

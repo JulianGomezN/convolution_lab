@@ -43,6 +43,15 @@ def test_missing_image_subprocess_without_traceback(tmp_path):
     assert "Error de imagen" in proc.stderr
 
 
+def test_texture_limit_is_image_error():
+    """R3.3: si la imagen supera GL_MAX_TEXTURE_SIZE se trata como error de imagen (código 2)."""
+    from src.texture_loader import ImageLoadError
+
+    app.check_texture_limit("a.png", (16384, 10), 16384)  # en el límite: válido
+    with pytest.raises(ImageLoadError, match="GL_MAX_TEXTURE_SIZE"):
+        app.check_texture_limit("a.png", (10, 16385), 16384)
+
+
 def test_default_image_comes_from_settings():
     assert main.default_image() == ROOT / "assets" / "images" / "orientacion.png"
 
