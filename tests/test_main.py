@@ -52,6 +52,16 @@ def test_texture_limit_is_image_error():
         app.check_texture_limit("a.png", (10, 16385), 16384)
 
 
+def test_window_size_leaves_room_for_full_state_title():
+    assert app.window_size((640, 480)) == (app.MIN_WINDOW_WIDTH, 480)
+    assert app.window_size((1920, 1080)) == (1920, 1080)
+
+
+def test_centered_viewport():
+    assert app.centered_viewport((1280, 480), (640, 480)) == (320, 0, 640, 480)
+    assert app.centered_viewport((640, 640), (640, 480)) == (0, 80, 640, 480)
+
+
 def test_default_image_comes_from_settings():
     assert main.default_image() == ROOT / "assets" / "images" / "orientacion.png"
 

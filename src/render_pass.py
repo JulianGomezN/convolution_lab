@@ -74,14 +74,14 @@ def run_pass(
     target: RenderTarget,
     textures: Mapping[str, moderngl.Texture],
     uniforms: Mapping[str, object] | None = None,
+    viewport: tuple[int, int, int, int] | None = None,
 ) -> None:
-    """Dibuja el quad con `prog` sobre `target`, leyendo `textures` (unidad i para la i-ésima)."""
+    """Dibuja el quad sobre `target`, opcionalmente dentro de un viewport."""
     if target.texture is not None and any(tex is target.texture for tex in textures.values()):
         # Leer y escribir la misma textura en una pasada es comportamiento indefinido (R12.3).
         raise AssertionError("run_pass: la textura de destino también es una entrada (feedback loop)")
-    w, h = target.size
     target.fbo.use()
-    quad.ctx.viewport = (0, 0, w, h)
+    quad.ctx.viewport = viewport or (0, 0, *target.size)
     for unit, (name, tex) in enumerate(textures.items()):
         tex.use(location=unit)
         set_uniform(prog, name, unit)

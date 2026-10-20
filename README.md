@@ -2,7 +2,8 @@
 
 Aplicación de escritorio para Computación Gráfica. Carga una imagen, la sube a la GPU como textura y le aplica máscaras de convolución en fragment shaders de OpenGL 3.3 core (moderngl + GLFW). Se cambia de filtro, modo de borde, etapa del pipeline Canny y método de desenfoque en tiempo real con el teclado.
 
-- La ventana mide exactamente lo mismo que la imagen y no se reescala.
+- La imagen se procesa y se dibuja a su resolución original; la ventana tiene un
+  ancho mínimo de 1280 px para que el título muestre completo el estado actual.
 - Solo se dibuja un quad de 4 vértices en coordenadas de recorte (±1). No hay matrices, cámara ni transformaciones geométricas.
 - Toda la convolución ocurre en los shaders GLSL. La CPU solo calcula los pesos y fija los uniforms.
 
@@ -40,7 +41,7 @@ Si al arrancar aparece "Error de OpenGL" (código 3), lo habitual es que falte e
 
 `--quick` (con `--benchmark` o `--experiments`) reduce el benchmark a 1 ejecución de calentamiento y 5 medidas por caso, para pruebas rápidas.
 
-Al arrancar, la consola muestra GL_VERSION, GL_RENDERER, GL_VENDOR y `imagen WxH | framebuffer WxH`.
+Al arrancar, la consola muestra GL_VERSION, GL_RENDERER, GL_VENDOR y `imagen WxH | ventana WxH`.
 
 Códigos de salida: 0 normal, 1 error inesperado, 2 error de imagen (no existe, no es válida o supera GL_MAX_TEXTURE_SIZE), 3 error de OpenGL/GLFW, 4 error de shader, 130 Ctrl+C.
 
@@ -67,6 +68,26 @@ Códigos de salida: 0 normal, 1 error inesperado, 2 error de imagen (no existe, 
 | Esc | Salir |
 
 El título de la ventana muestra siempre el estado: modo, kernel o etapa, borde, normalización, mapeo, σ, α, umbrales, 2D/separable y el tiempo de GPU del último procesado. Las flechas y RePág/AvPág responden a la autorrepetición. Se usa RePág/AvPág en lugar de +/- porque en el teclado español esas teclas no están donde GLFW las espera.
+
+La imagen se dibuja centrada en la ventana. Las franjas restantes son intencionales y sirven
+para que el título de estado tenga espacio sin deformar la imagen.
+
+### Ideas para mejorar las franjas
+
+- Usar un fondo gris azulado oscuro en lugar de negro puro, para que el contraste sea menos agresivo.
+- Aplicar una versión ampliada y desenfocada de la propia imagen como fondo, manteniendo la imagen
+  principal nítida al centro.
+- Mostrar una cuadrícula o un patrón sutil en las franjas para que parezcan parte del visor.
+- Mantener el fondo negro cuando se analizan bordes, ya que ofrece una referencia neutra y no altera
+  la lectura de los resultados.
+
+Actualmente las franjas laterales incluyen un HUD discreto con el nombre, la resolución y el modo
+activo. El HUD solo pertenece a la ventana interactiva; las capturas siguen teniendo exactamente
+el tamaño de la imagen y no incluyen esa información.
+
+El marco de la imagen también cambia de color según el borde activo: rojo para `zero`, verde para
+`replicate`, azul para `reflect` y violeta para `wrap`. Esto permite comparar visualmente las
+opciones de borde sin confundirlas con el fondo.
 
 ### Kernel personalizado
 
@@ -109,7 +130,7 @@ Los tests comparan cada shader con una referencia en numpy (error ≤ 1e-4) y co
 - **Umbral de Canny dependiente de σ.** Los umbrales son absolutos sobre |G|/4, la fracción de un escalón negro→blanco ideal sin suavizar. El gaussiano previo atenúa el pico de |G|: un escalón ideal da |G|/4 máx. ≈ 0.89 con σ = 0.5, 0.64 con σ = 1, 0.51 con σ = 1.4 y 0.38 con σ = 2. En `orientacion.png` (contraste 0.81), el máximo con σ = 1.4 es 0.41. Por eso el umbral alto por defecto es 0.3 (bajo 0.12). Al subir σ conviene bajar el umbral con AvPág, o la etapa Bordes se queda negra.
 - **Canny sin histéresis iterativa.** Un píxel débil solo se acepta si alguno de sus 8 vecinos es fuerte; no se propagan cadenas largas de débiles (fuera de alcance).
 - **Sin orientación EXIF.** Las fotos de móvil pueden verse giradas, porque rotar sería una transformación geométrica. Prepara la imagen girada de antemano.
-- **Escalado de DPI de Windows.** La ventana se crea a W×H píxeles físicos sin reescalar. Con escalado del 125 % o más, se ve más pequeña que otras ventanas. Si el framebuffer no coincide con W×H, la consola avisa y se sigue dibujando sin reescalar.
+- **Escalado de DPI de Windows.** La ventana se crea con el tamaño solicitado en píxeles físicos. Con escalado del 125 % o más, el framebuffer puede no coincidir; la consola avisa y la imagen se sigue dibujando a su resolución original.
 - **Imágenes mayores que el monitor.** Se avisa y se continúa; parte de la ventana puede quedar fuera de la pantalla. Las capturas y los experimentos salen siempre a resolución completa. Si la imagen supera GL_MAX_TEXTURE_SIZE, termina con código 2.
 - **Valores sRGB sin linealizar** y gris Rec.601 (como OpenCV). El alfa de entrada se ignora y la salida siempre es opaca.
 - **Consola.** Con la salida redirigida a un archivo, Windows usa la codificación cp1252. Por eso la consola escribe "sigma" en lugar de σ; el título de la ventana sí usa σ y α.

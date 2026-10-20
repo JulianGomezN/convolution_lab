@@ -16,6 +16,8 @@ from pathlib import Path
 
 import glfw
 import moderngl
+import numpy as np
+from PIL import Image, ImageDraw
 
 from src import benchmark, capture, experiments, kernels, state as st
 from src.config import SETTINGS_PATH, ConfigError, SettingsWatcher, load_settings
@@ -26,6 +28,15 @@ from src.shader_loader import load_program
 from src.texture_loader import ImageLoadError, create_texture, load_image
 
 APP_NAME = st.APP_NAME
+# Ancho mínimo para que el título, que contiene el estado completo, no quede
+# recortado en imágenes pequeñas. La imagen sigue procesándose a su resolución.
+MIN_WINDOW_WIDTH = 1280
+EDGE_COLORS = {
+    st.BORDER_ZERO: (238, 92, 92, 255),
+    st.BORDER_REPLICATE: (101, 210, 140, 255),
+    st.BORDER_REFLECT: (93, 174, 232, 255),
+    st.BORDER_WRAP: (205, 137, 238, 255),
+}
 # Con este tiempo de espera la vigilancia del mtime responde en < 1 s (R7.3).
 WAIT_TIMEOUT_S = 0.25
 
@@ -86,6 +97,24 @@ class GLContextError(Exception):
     """GLFW no se inicia, la ventana no se crea o OpenGL < 3.3 (código de salida 3)."""
 
 
+def window_size(image_size: tuple[int, int]) -> tuple[int, int]:
+    """Devuelve el tamaño de ventana, reservando espacio para el título de estado."""
+    width, height = image_size
+    return max(width, MIN_WINDOW_WIDTH), height
+
+
+def centered_viewport(container_size: tuple[int, int], content_size: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Devuelve el rectángulo centrado donde se dibuja la imagen, en píxeles."""
+    container_w, container_h = container_size
+    content_w, content_h = content_size
+    return (
+        max(0, (container_w - content_w) // 2),
+        max(0, (container_h - content_h) // 2),
+        content_w,
+        content_h,
+    )
+
+
 def _warn(msg: str) -> None:
     print(f"Aviso: {msg}", file=sys.stderr)
 
@@ -96,6 +125,7 @@ class App:
         self.image_path = Path(image_path)
         self.height, self.width = image.shape[:2]
         self.size = (self.width, self.height)
+        self.window_size = window_size(self.size)
         self.window = None
         self.ctx = None
         self.last_glfw_error = None
@@ -136,7 +166,7 @@ class App:
         if not glfw.init():
             raise self._gl_error("No se pudo inicializar GLFW.")
 
-        # Contexto 3.3 core forward-compatible (R1.1); ventana fija W×H (R3.1).
+        # Contexto 3.3 core forward-compatible (R1.1); ventana no redimensionable.
         glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
         glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
         glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
@@ -145,7 +175,7 @@ class App:
         glfw.window_hint(glfw.SCALE_TO_MONITOR, False)  # sin reescalado por DPI
         glfw.window_hint(glfw.VISIBLE, False)  # se muestra tras validar tamaños
 
-        self.window = glfw.create_window(self.width, self.height, APP_NAME, None, None)
+        self.window = glfw.create_window(*self.window_size, APP_NAME, None, None)
         if not self.window:
             raise self._gl_error("No se pudo crear la ventana con un contexto OpenGL 3.3 core.")
         glfw.make_context_current(self.window)
@@ -183,21 +213,26 @@ class App:
                     "no se reescala, parte de la ventana puede quedar fuera de la pantalla."
                 )
         fw, fh = glfw.get_framebuffer_size(self.window)
-        print(f"imagen {w}x{h} | framebuffer {fw}x{fh}")
-        if (fw, fh) != (w, h):
+        print(f"imagen {w}x{h} | ventana {fw}x{fh}")
+        if (fw, fh) != self.window_size:
             _warn(
-                f"el framebuffer ({fw}x{fh}) no coincide con la imagen ({w}x{h}); "
-                f"se sigue dibujando con viewport {w}x{h}, sin reescalar."
+                f"el framebuffer ({fw}x{fh}) no coincide con la ventana solicitada "
+                f"({self.window_size[0]}x{self.window_size[1]}); "
+                f"la imagen se dibuja a su resolución {w}x{h}, sin reescalar."
             )
 
     def _create_gl_objects(self) -> None:
         ctx = self.ctx
         self.quad = self._keep(Quad(ctx))
         self.prog_display = self._keep(load_program(ctx, "display.frag"))
+        self.prog_status = self._keep(load_program(ctx, "status.frag"))
         self.input_tex = self._keep(create_texture(ctx, self.image))
         self.processor = self._keep(Processor(ctx, self.quad, self.input_tex))
-        self.screen = RenderTarget.screen(ctx, self.size)
+        self.screen = RenderTarget.screen(ctx, self.window_size)
+        self.status_tex = self._keep(ctx.texture(self.window_size, 4, dtype="f1"))
+        self.status_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self.timer = benchmark.GpuTimer(ctx)
+        self._update_status_texture()
 
     def _keep(self, obj):
         self._resources.append(obj)
@@ -218,8 +253,9 @@ class App:
         píxeles de ventana, que coincide con el sistema fila 0 arriba de display.frag.
         No dibuja: set_cursor marca dirty solo si la lupa está activa y el bucle redibuja."""
         w, h = self.size
-        cx = min(w - 1, max(0, int(x)))
-        cy = min(h - 1, max(0, int(y)))
+        offset_x, offset_y, _, _ = centered_viewport(self.window_size, self.size)
+        cx = min(w - 1, max(0, int(x) - offset_x))
+        cy = min(h - 1, max(0, int(y) - offset_y))
         old = self.state
         new = st.set_cursor(old, cx, cy)
         if new is not old:
@@ -321,13 +357,50 @@ class App:
     def _title(self) -> str:
         return st.title(self.state, self.image_path.name, self.size, self.last_gpu_ms)
 
+    def _update_status_texture(self) -> None:
+        """Actualiza el HUD transparente que ocupa solo las franjas laterales."""
+        width, height = self.window_size
+        image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        left, top, content_width, content_height = centered_viewport(self.window_size, self.size)
+        panel_color = (35, 42, 61, 235)
+        accent = EDGE_COLORS[self.state.border]
+        text_color = (222, 231, 240, 255)
+        draw.rectangle(
+            (left, top, left + content_width - 1, top + content_height - 1),
+            outline=accent,
+            width=3,
+        )
+        if left:
+            draw.rectangle((0, 0, left - 1, height - 1), fill=panel_color)
+            draw.rectangle((left - 2, 0, left - 1, height - 1), fill=accent)
+        right = width - left - content_width
+        if right:
+            right_start = left + content_width
+            draw.rectangle((right_start, 0, width - 1, height - 1), fill=panel_color)
+            draw.rectangle((right_start, 0, right_start + 1, height - 1), fill=accent)
+        lines = [
+            "IMAGEN",
+            self.image_path.name,
+            f"{self.size[0]} x {self.size[1]}",
+            "",
+            "MODO",
+            st.MODE_NAMES.get(self.state.mode, self.state.mode).upper(),
+            "",
+            "BORDE",
+            st.BORDER_NAMES[self.state.border].upper(),
+        ]
+        if left >= 180:
+            draw.multiline_text((12, 16), "\n".join(lines), fill=text_color, spacing=5)
+        self.status_tex.write(np.asarray(image, dtype=np.uint8).tobytes())
+
     def render(self) -> bool:
         fw, fh = glfw.get_framebuffer_size(self.window)
         if fw == 0 or fh == 0:  # ventana minimizada: no se dibuja
             return False
         # Tiempo de GPU de las pasadas de procesado, sin la de pantalla (R14.5).
         (tex, view), self.last_gpu_ms = self.timer.measure(lambda: self.processor.run(self.state))
-        # Se limpia todo el framebuffer por si es mayor que W×H; luego viewport W×H.
+        # La imagen conserva su tamaño y queda centrada; el resto es el fondo.
         self.ctx.screen.use()
         self.ctx.viewport = (0, 0, fw, fh)
         self.ctx.clear(0.0, 0.0, 0.0, 1.0)
@@ -338,8 +411,14 @@ class App:
             self.prog_display,
             self.screen,
             {"u_src": tex, "u_original": self.input_tex},
-            view.uniforms(flip_y=1),
+            view.uniforms(flip_y=1, origin=centered_viewport((fw, fh), self.size)[:2]),
+            viewport=centered_viewport((fw, fh), self.size),
         )
+        self._update_status_texture()
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        run_pass(self.quad, self.prog_status, self.screen, {"u_status": self.status_tex})
+        self.ctx.disable(moderngl.BLEND)
         glfw.swap_buffers(self.window)
         glfw.set_window_title(self.window, self._title())
         return True

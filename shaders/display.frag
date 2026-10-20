@@ -24,6 +24,7 @@
 uniform sampler2D u_src;
 uniform sampler2D u_original;
 uniform int u_flip_y;
+uniform ivec2 u_viewport_origin;
 uniform int u_channel;
 uniform int u_map;
 uniform float u_gain;
@@ -44,7 +45,7 @@ vec3 hsv2rgb(vec3 c) {
 
 void main() {
     ivec2 size = textureSize(u_src, 0);
-    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 p = ivec2(gl_FragCoord.xy) - u_viewport_origin;
     if (u_flip_y == 1) {
         p.y = size.y - 1 - p.y;
     }

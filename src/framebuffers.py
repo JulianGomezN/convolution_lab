@@ -30,7 +30,7 @@ class RenderTarget:
 
     @classmethod
     def screen(cls, ctx: moderngl.Context, size: tuple[int, int]) -> "RenderTarget":
-        """La ventana; el viewport se fija a W×H aunque el framebuffer difiera (R3.2)."""
+        """La ventana; el viewport de cada pasada puede ocupar solo una región."""
         return cls(ctx.screen, size, None, owned=False)
 
     @property

@@ -47,7 +47,7 @@ class View:
     lens_radius: float = 0.0  # u_lens_radius (px)
     lens_edge: float = 12.0  # u_lens_edge (px, ancho del borde suave)
 
-    def uniforms(self, flip_y: int) -> dict:
+    def uniforms(self, flip_y: int, origin: tuple[int, int] = (0, 0)) -> dict:
         """Uniforms de display.frag: flip_y = 1 en pantalla, 0 en la captura (D2).
 
         No incluye u_original: la textura original la inyecta el llamador como
@@ -55,6 +55,7 @@ class View:
         """
         return {
             "u_flip_y": flip_y,
+            "u_viewport_origin": origin,
             "u_channel": self.channel,
             "u_map": self.map,
             "u_gain": self.gain,
