@@ -400,8 +400,69 @@ def test_title_gpu_time():
 
 def test_repeat_keys():
     assert st.REPEAT_KEYS == {
-        st.KEY_UP, st.KEY_DOWN, st.KEY_LEFT, st.KEY_RIGHT, st.KEY_PAGE_UP, st.KEY_PAGE_DOWN
+        st.KEY_UP, st.KEY_DOWN, st.KEY_LEFT, st.KEY_RIGHT, st.KEY_PAGE_UP, st.KEY_PAGE_DOWN,
+        st.KEY_LBRACKET, st.KEY_RBRACKET,
     }
+
+
+# --- lupa (R21) ------------------------------------------------------------
+
+
+def test_lens_defaults():
+    s = AppState()
+    assert s.lens_on is False
+    assert s.lens_radius == 80.0
+    assert (s.lens_cx, s.lens_cy) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize("mode", [st.MODE_KERNEL, st.MODE_BLUR, st.MODE_UNSHARP, st.MODE_CANNY])
+def test_l_toggles_lens_in_any_mode(mode):
+    s0 = _clean(mode=mode)
+    s1, action = handle_key(s0, st.KEY_L)
+    assert action is None and s1.lens_on is True and s1.dirty
+    assert s1.mode == mode  # no cambia de modo
+    s2, _ = handle_key(replace(s1, dirty=False), st.KEY_L)
+    assert s2.lens_on is False and s2.dirty
+
+
+@pytest.mark.parametrize("mode", [st.MODE_KERNEL, st.MODE_CANNY])
+def test_brackets_step_radius_in_any_mode(mode):
+    s = _clean(mode=mode, lens_radius=80.0)
+    s, action = handle_key(s, st.KEY_RBRACKET)
+    assert action is None and s.lens_radius == 90.0 and s.dirty
+    s, _ = handle_key(replace(s, dirty=False), st.KEY_LBRACKET)
+    s, _ = handle_key(s, st.KEY_LBRACKET)
+    assert s.lens_radius == 70.0
+
+
+def test_lens_radius_limits():
+    s = _clean(lens_radius=st.LENS_RADIUS_MAX)
+    assert handle_key(s, st.KEY_RBRACKET)[0] is s  # en el tope no cambia ni redibuja
+    s = _clean(lens_radius=st.LENS_RADIUS_MIN)
+    assert handle_key(s, st.KEY_LBRACKET)[0] is s
+    s = _clean(lens_radius=st.LENS_RADIUS_MIN)
+    for _ in range(200):
+        s, _ = handle_key(s, st.KEY_RBRACKET)
+    assert s.lens_radius == st.LENS_RADIUS_MAX
+
+
+def test_set_cursor_only_moves_when_lens_on():
+    off = _clean(lens_on=False, lens_cx=1.0, lens_cy=2.0)
+    assert st.set_cursor(off, 50, 60) is off  # apagada: mismo estado, sin dirty
+    on = _clean(lens_on=True)
+    moved = st.set_cursor(on, 50, 60)
+    assert (moved.lens_cx, moved.lens_cy) == (50, 60) and moved.dirty
+    assert on.lens_on and moved.lens_on  # solo cambia el centro
+
+
+def test_title_mentions_lens():
+    assert "Lupa: on r=80" in st.title(AppState(lens_on=True, lens_radius=80.0), "a.png", (7, 5))
+    assert "Lupa" not in st.title(AppState(lens_on=False), "a.png", (7, 5))
+
+
+def test_help_lists_lens():
+    for token in ("L ", "[ ]", "lupa"):
+        assert token in st.HELP_TEXT
 
 
 @pytest.mark.parametrize(

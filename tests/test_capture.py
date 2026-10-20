@@ -157,6 +157,25 @@ def test_capture_matches_screen_mapping(ctx, quad, display):
         np.testing.assert_allclose(rgb[..., c] / 255.0, expected, atol=1.0 / 255.0 + 1e-6)
 
 
+def test_capture_respects_lens(ctx, quad, display):
+    """R21: con `original` y la lupa encendida, el centro sale procesado y fuera original."""
+    src = np.zeros((H, W, 4), np.float32)
+    src[..., :3] = 0.9  # procesado = claro
+    original = np.zeros((H, W, 4), np.float32)
+    original[..., :3] = 0.2  # original = oscuro, distinto
+    tex = create_texture(ctx, src)
+    orig = create_texture(ctx, original)
+    try:
+        # Centro de la lupa en el medio de la imagen, radio que no llega a las esquinas.
+        view = View(lens_on=1, lens_center=(W // 2, H // 2), lens_radius=1.0, lens_edge=0.5)
+        rgb = capture.render_display(ctx, quad, display, tex, view, original=orig)
+    finally:
+        orig.release()
+        tex.release()
+    np.testing.assert_allclose(rgb[H // 2, W // 2] / 255.0, 0.9, atol=1.0 / 255.0 + 1e-6)  # centro procesado
+    np.testing.assert_allclose(rgb[0, 0] / 255.0, 0.2, atol=1.0 / 255.0 + 1e-6)  # esquina original
+
+
 def test_capture_is_screen_flipped(ctx, quad, display):
     """Con u_flip_y = 1 (pantalla) las filas salen invertidas respecto a la captura: en
     pantalla la fila 0 del framebuffer es la de abajo, así que ambas muestran lo mismo."""

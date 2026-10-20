@@ -11,11 +11,12 @@ es aparte y de solo lectura.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 import moderngl
 
-from src import kernels
+from src import kernels, state as st
 from src.framebuffers import PingPong
 from src.render_pass import Quad, run_pass
 from src.shader_loader import load_program
@@ -31,15 +32,37 @@ MAG_GAIN = 0.25
 
 @dataclass(frozen=True)
 class View:
-    """Cómo mostrar la textura resultante en display.frag."""
+    """Cómo mostrar la textura resultante en display.frag.
+
+    Los campos de lupa tienen defaults que no cambian nada (u_lens_on = 0): así los
+    llamadores y tests que crean View() a mano siguen mostrando el resultado de
+    siempre. El Processor los rellena desde el AppState (R21).
+    """
 
     map: int = kernels.MAP_CLIP  # u_map
     gain: float = 1.0  # u_gain
     channel: int = CH_RGB  # u_channel
+    lens_on: int = 0  # u_lens_on
+    lens_center: tuple[float, float] = (0.0, 0.0)  # u_lens_center (px, fila 0 arriba)
+    lens_radius: float = 0.0  # u_lens_radius (px)
+    lens_edge: float = 12.0  # u_lens_edge (px, ancho del borde suave)
 
     def uniforms(self, flip_y: int) -> dict:
-        """Uniforms de display.frag: flip_y = 1 en pantalla, 0 en la captura (D2)."""
-        return {"u_flip_y": flip_y, "u_channel": self.channel, "u_map": self.map, "u_gain": self.gain}
+        """Uniforms de display.frag: flip_y = 1 en pantalla, 0 en la captura (D2).
+
+        No incluye u_original: la textura original la inyecta el llamador como
+        entrada de run_pass (solo cuando quiere la lupa).
+        """
+        return {
+            "u_flip_y": flip_y,
+            "u_channel": self.channel,
+            "u_map": self.map,
+            "u_gain": self.gain,
+            "u_lens_on": self.lens_on,
+            "u_lens_center": self.lens_center,
+            "u_lens_radius": self.lens_radius,
+            "u_lens_edge": self.lens_edge,
+        }
 
 
 # Pasadas de Canny en orden (R12.2) y cuántas hacen falta para ver cada etapa (R12.5),
@@ -85,6 +108,23 @@ class Processor:
         self._resources.append(obj)
         return obj
 
+    def _with_lens(self, view: View, state: AppState) -> View:
+        """Añade a `view` los uniforms de lupa del estado (R21).
+
+        u_lens_center está en píxeles con la fila 0 arriba, igual que lens_cx/lens_cy
+        del estado (que vienen del callback del cursor). Con la lupa apagada deja el
+        View tal cual (lens_on = 0), así el resultado es idéntico al de siempre.
+        """
+        if not state.lens_on:
+            return view
+        return dataclasses.replace(
+            view,
+            lens_on=1,
+            lens_center=(state.lens_cx, state.lens_cy),
+            lens_radius=state.lens_radius,
+            lens_edge=st.LENS_EDGE,
+        )
+
     def _pass(
         self, name: str, prog, src: moderngl.Texture, uniforms: dict, extra: dict | None = None
     ) -> moderngl.Texture:
@@ -123,10 +163,11 @@ class Processor:
             tex = self._pass(
                 "kernel", self.prog_convolve, self.source, {"u_kernel": weights, "u_border": state.border}
             )
-            return tex, View(map=state.display_map)
+            return tex, self._with_lens(View(map=state.display_map), state)
         if state.mode == MODE_BLUR:
             weights = kernels.blur_weights(state.profile, state.sigma)
-            return self.blur(self.source, weights, state.border, state.separable), View()
+            tex = self.blur(self.source, weights, state.border, state.separable)
+            return tex, self._with_lens(View(), state)
         if state.mode == MODE_UNSHARP:
             # orig + α·(orig − blur_σ(orig)) con el gaussiano (R13.1). El blur queda en
             # pp.src y unsharp escribe en pp.dst; la entrada original es aparte.
@@ -138,7 +179,7 @@ class Processor:
                 {"u_alpha": state.alpha, "u_border": state.border},
                 extra={"u_blur": blur},
             )
-            return tex, View()
+            return tex, self._with_lens(View(), state)
         if state.mode == MODE_CANNY:
             return self._run_canny(state)
         raise ValueError(f"modo no implementado: {state.mode}")
@@ -146,7 +187,7 @@ class Processor:
     def _run_canny(self, state: AppState) -> tuple[moderngl.Texture, View]:
         """Ejecuta solo las pasadas necesarias hasta la etapa visible (R12.5)."""
         n = STAGE_PASSES[state.stage]
-        view = STAGE_VIEWS[state.stage]
+        view = self._with_lens(STAGE_VIEWS[state.stage], state)
         border = {"u_border": state.border}
         if n == 0:
             return self.source, view

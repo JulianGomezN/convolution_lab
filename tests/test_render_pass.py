@@ -150,3 +150,58 @@ def test_display_maps(ctx, quad, display, display_map, gain, func):
     finally:
         out_rt.release()
         tex.release()
+
+
+# --- lupa (R21) ------------------------------------------------------------
+
+
+def test_display_lens_off_matches_plain(ctx, quad, display):
+    """Con u_lens_on = 0 el resultado es idéntico al de siempre, aunque se pase u_original."""
+    src = _random_f4(6)
+    original = _random_f4(7)
+    tex = create_texture(ctx, src)
+    orig = create_texture(ctx, original)
+    plain = RenderTarget.create(ctx, (W, H), dtype="f1")
+    lensed = RenderTarget.create(ctx, (W, H), dtype="f1")
+    try:
+        base = {"u_flip_y": 0, "u_map": 0, "u_gain": 1.0}
+        run_pass(quad, display, plain, {"u_src": tex}, base)
+        run_pass(quad, display, lensed, {"u_src": tex, "u_original": orig}, {**base, "u_lens_on": 0})
+        np.testing.assert_array_equal(plain.read(), lensed.read())
+    finally:
+        plain.release()
+        lensed.release()
+        orig.release()
+        tex.release()
+
+
+def test_display_lens_on_mixes_src_and_original(ctx, quad, display):
+    """Con u_lens_on = 1: centro del círculo ~ u_src, lejos ~ u_original, borde intermedio."""
+    src = np.zeros((H, W, 4), np.float32)
+    src[..., :3] = 0.8  # procesado = constante clara
+    original = np.zeros((H, W, 4), np.float32)
+    original[..., :3] = 0.1  # original = constante oscura, distinta
+    tex = create_texture(ctx, src)
+    orig = create_texture(ctx, original)
+    out_rt = RenderTarget.create(ctx, (W, H), dtype="f1")
+    try:
+        # Centro en la esquina (0, 0); banda de transición en d ∈ [0.5, 2.5] px:
+        # el píxel (0, 1) (d = 1) cae dentro de la transición.
+        run_pass(
+            quad, display, out_rt,
+            {"u_src": tex, "u_original": orig},
+            {"u_flip_y": 0, "u_map": 0, "u_gain": 1.0, "u_lens_on": 1,
+             "u_lens_center": (0.0, 0.0), "u_lens_radius": 2.5, "u_lens_edge": 2.0},
+        )
+        out = out_rt.read()[..., :3] / 255.0
+    finally:
+        out_rt.release()
+        orig.release()
+        tex.release()
+    # Píxel del centro (0, 0), d = 0: dentro del círculo → procesado (0.8).
+    np.testing.assert_allclose(out[0, 0], 0.8, atol=1.0 / 255.0 + 1e-6)
+    # Píxel lejano (esquina opuesta), d ≫ radio: fuera → original (0.1).
+    np.testing.assert_allclose(out[H - 1, W - 1], 0.1, atol=1.0 / 255.0 + 1e-6)
+    # Píxel (0, 1), d = 1 px dentro de la banda: valor estrictamente entre ambos.
+    mid = out[1, 0, 0]
+    assert 0.1 + 1e-3 < mid < 0.8 - 1e-3

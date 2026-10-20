@@ -25,6 +25,9 @@ KEY_C = "C"
 KEY_S = "S"
 KEY_G = "G"
 KEY_P = "P"
+KEY_L = "L"
+KEY_LBRACKET = "LBRACKET"
+KEY_RBRACKET = "RBRACKET"
 KEY_UP = "UP"
 KEY_DOWN = "DOWN"
 KEY_LEFT = "LEFT"
@@ -33,7 +36,9 @@ KEY_PAGE_UP = "PAGE_UP"
 KEY_PAGE_DOWN = "PAGE_DOWN"
 KEY_ESCAPE = "ESCAPE"
 # Teclas que también responden a la autorrepetición del teclado.
-REPEAT_KEYS = frozenset({KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_PAGE_UP, KEY_PAGE_DOWN})
+REPEAT_KEYS = frozenset(
+    {KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_PAGE_UP, KEY_PAGE_DOWN, KEY_LBRACKET, KEY_RBRACKET}
+)
 
 # --- acciones -----------------------------------------------------------
 ACTION_RELOAD = "reload"
@@ -71,6 +76,12 @@ STAGE_COUNT = len(STAGE_NAMES)  # etapas 1..11
 # Umbral alto sobre |G|/4 (S7): paso de RePág/AvPág y límites (R12.11).
 HIGH_STEP, HIGH_MIN, HIGH_MAX = 0.05, 0.05, 1.0
 
+# --- lupa (R21) ----------------------------------------------------------
+# Radio del círculo en píxeles: límites y paso de [ y ]. LENS_EDGE es el ancho
+# del borde suave (smoothstep) de display.frag, fijo.
+LENS_RADIUS_MIN, LENS_RADIUS_MAX, LENS_RADIUS_STEP = 10.0, 600.0, 10.0
+LENS_EDGE = 12.0
+
 APP_NAME = "Laboratorio de convolución"
 
 HELP_TEXT = """\
@@ -90,6 +101,8 @@ Controles:
            Magnitud, Dirección, NMS, Clasificación, Bordes
   RePág/AvPág     alfa de Unsharp (+/- 0.25) o umbral alto de Canny
                   (+/- 0.05; bajo = ratio · alto)
+  L        lupa: aplicar el efecto solo en el círculo bajo el cursor
+  [ ]      radio de la lupa (-/+ 10 px)
   G        guardar captura del resultado en results/
   P        benchmark: gaussiano 2D directo frente a separable (CSV en results/)
   R        recargar config/settings.json
@@ -115,6 +128,10 @@ class AppState:
     stage: int = 1  # etapa visible de Canny, 1..11; se conserva al salir y volver
     high: float = 0.3  # umbral alto sobre |G|/4 (S7: tras el gaussiano σ=1.4 un escalón ideal da ≈ 0.51)
     low_ratio: float = 0.4  # bajo = low_ratio · alto
+    lens_on: bool = False  # lupa activa (R21): el efecto solo se ve bajo el cursor
+    lens_radius: float = 80.0  # radio del círculo de la lupa en píxeles
+    lens_cx: float = 0.0  # centro de la lupa en píxeles, columna (fila 0 arriba)
+    lens_cy: float = 0.0  # centro de la lupa en píxeles, fila (fila 0 arriba)
     dirty: bool = True
 
     @property
@@ -211,6 +228,14 @@ def handle_key(state: AppState, key) -> tuple[AppState, str | None]:
             return state, None
         high = round(min(HIGH_MAX, max(HIGH_MIN, state.high + sign * HIGH_STEP)), 4)
         return (state, None) if high == state.high else (replace(state, high=high, dirty=True), None)
+    if key == KEY_L:
+        # La lupa funciona en cualquier modo (R21).
+        return replace(state, lens_on=not state.lens_on, dirty=True), None
+    if key in (KEY_LBRACKET, KEY_RBRACKET):
+        # Radio ± paso dentro de [MIN, MAX], redondeado como σ para no acumular error.
+        delta = LENS_RADIUS_STEP if key == KEY_RBRACKET else -LENS_RADIUS_STEP
+        radius = round(min(LENS_RADIUS_MAX, max(LENS_RADIUS_MIN, state.lens_radius + delta)), 4)
+        return (state, None) if radius == state.lens_radius else (replace(state, lens_radius=radius, dirty=True), None)
     if key == KEY_G:
         return state, ACTION_CAPTURE
     if key == KEY_P:
@@ -222,6 +247,27 @@ def handle_key(state: AppState, key) -> tuple[AppState, str | None]:
     if key == KEY_ESCAPE:
         return state, ACTION_QUIT
     return state, None
+
+
+def set_cursor(state: AppState, x: float, y: float) -> AppState:
+    """Mueve el centro de la lupa a (x, y) en píxeles (R21).
+
+    Función pura: si la lupa está activa devuelve un estado nuevo con el centro
+    actualizado y dirty=True (hay que redibujar); si no, devuelve el mismo estado
+    sin marcar dirty, así mover el ratón con la lupa apagada no gasta GPU. (x, y)
+    vienen del callback del cursor con el origen arriba a la izquierda, que es el
+    mismo sistema fila 0 arriba que usa u_lens_center en display.frag.
+    """
+    if not state.lens_on:
+        return state
+    return replace(state, lens_cx=x, lens_cy=y, dirty=True)
+
+
+def lens_label(state: AppState) -> str:
+    """Texto de la lupa para el título: «Lupa: on r=80» o «Lupa: off»."""
+    if state.lens_on:
+        return f"Lupa: on r={state.lens_radius:g}"
+    return "Lupa: off"
 
 
 def normalize_label(state: AppState) -> str:
@@ -278,6 +324,8 @@ def title(state: AppState, image_name: str, size: tuple[int, int], gpu_ms: float
             f"alto={state.high:.2f} bajo={state.low:.2f}",
             method_label(state),
         ]
+    if state.lens_on:
+        parts.append(lens_label(state))  # «Lupa: on r=…»; apagada no se muestra
     if gpu_ms is not None:
         parts.append(f"GPU: {gpu_ms:.2f} ms")
     return " | ".join(parts)

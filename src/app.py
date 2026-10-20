@@ -44,6 +44,9 @@ KEY_MAP = {
     glfw.KEY_S: st.KEY_S,
     glfw.KEY_G: st.KEY_G,
     glfw.KEY_P: st.KEY_P,
+    glfw.KEY_L: st.KEY_L,
+    glfw.KEY_LEFT_BRACKET: st.KEY_LBRACKET,
+    glfw.KEY_RIGHT_BRACKET: st.KEY_RBRACKET,
     glfw.KEY_UP: st.KEY_UP,
     glfw.KEY_DOWN: st.KEY_DOWN,
     glfw.KEY_LEFT: st.KEY_LEFT,
@@ -52,6 +55,14 @@ KEY_MAP = {
     glfw.KEY_PAGE_DOWN: st.KEY_PAGE_DOWN,
     glfw.KEY_ESCAPE: st.KEY_ESCAPE,
 }
+
+# En un teclado español la tecla física de [ y ] no siempre coincide con GLFW_KEY_
+# LEFT/RIGHT_BRACKET; el teclado numérico - y + sirve de alias para el radio de la
+# lupa. Se añade solo si GLFW define esas teclas en esta versión.
+for _glfw_key, _lens_key in (("KEY_KP_SUBTRACT", st.KEY_LBRACKET), ("KEY_KP_ADD", st.KEY_RBRACKET)):
+    _code = getattr(glfw, _glfw_key, None)
+    if _code is not None:
+        KEY_MAP[_code] = _lens_key
 
 # Campos de Settings → campos de AppState que se toman de settings.json.
 SETTINGS_TO_STATE = {
@@ -152,6 +163,7 @@ class App:
         self._create_gl_objects()
 
         glfw.set_key_callback(self.window, self._on_key)
+        glfw.set_cursor_pos_callback(self.window, self._on_cursor_pos)
         # Sin esto, Windows deja la ventana en negro tras minimizarla o taparla.
         glfw.set_window_refresh_callback(self.window, self._on_refresh)
         glfw.set_window_title(self.window, self._title())
@@ -201,6 +213,19 @@ class App:
         if action == glfw.PRESS or (action == glfw.REPEAT and mapped in st.REPEAT_KEYS):
             self.apply_key(mapped)
 
+    def _on_cursor_pos(self, window, x, y):
+        """Mueve el centro de la lupa (R21). GLFW da el origen arriba a la izquierda en
+        píxeles de ventana, que coincide con el sistema fila 0 arriba de display.frag.
+        No dibuja: set_cursor marca dirty solo si la lupa está activa y el bucle redibuja."""
+        w, h = self.size
+        cx = min(w - 1, max(0, int(x)))
+        cy = min(h - 1, max(0, int(y)))
+        old = self.state
+        new = st.set_cursor(old, cx, cy)
+        if new is not old:
+            self.state = new
+            glfw.set_window_title(self.window, self._title())
+
     def apply_key(self, key: str) -> None:
         """Aplica una tecla de state.py: nuevo estado, acción, consola y título."""
         if key == kernels.CUSTOM_KEY and self.watcher.changed():
@@ -225,7 +250,9 @@ class App:
         tex, view = self.processor.run(self.state)
         path = capture.unique_path(self.results_dir / capture.capture_name(self.state, datetime.now()))
         try:
-            rgb = capture.render_display(self.ctx, self.quad, self.prog_display, tex, view)
+            rgb = capture.render_display(
+                self.ctx, self.quad, self.prog_display, tex, view, getattr(self, "input_tex", None)
+            )
             capture.save_png(rgb, path)
         except capture.CaptureError as exc:
             print(f"Error al guardar la captura: {exc}", file=sys.stderr)
@@ -304,7 +331,15 @@ class App:
         self.ctx.screen.use()
         self.ctx.viewport = (0, 0, fw, fh)
         self.ctx.clear(0.0, 0.0, 0.0, 1.0)
-        run_pass(self.quad, self.prog_display, self.screen, {"u_src": tex}, view.uniforms(flip_y=1))
+        # u_original = textura de entrada para la lupa (R21). No dispara la aserción
+        # anti-feedback: el destino es self.screen.texture, distinto de input_tex.
+        run_pass(
+            self.quad,
+            self.prog_display,
+            self.screen,
+            {"u_src": tex, "u_original": self.input_tex},
+            view.uniforms(flip_y=1),
+        )
         glfw.swap_buffers(self.window)
         glfw.set_window_title(self.window, self._title())
         return True

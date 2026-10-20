@@ -75,12 +75,24 @@ def unique_path(path: Path) -> Path:
 
 
 def render_display(
-    ctx: moderngl.Context, quad: Quad, prog_display: moderngl.Program, tex: moderngl.Texture, view: View
+    ctx: moderngl.Context,
+    quad: Quad,
+    prog_display: moderngl.Program,
+    tex: moderngl.Texture,
+    view: View,
+    original: moderngl.Texture | None = None,
 ) -> np.ndarray:
-    """Dibuja `tex` con display.frag en un FBO RGBA8 del mismo tamaño y lo devuelve como H×W×3 uint8."""
+    """Dibuja `tex` con display.frag en un FBO RGBA8 del mismo tamaño y lo devuelve como H×W×3 uint8.
+
+    Con `original` se añade como entrada u_original para que la captura respete la
+    lupa (R21); por defecto es None y la pasada es la de siempre (retrocompatible).
+    """
     target = RenderTarget.create(ctx, tuple(tex.size), dtype="f1")  # W×H (R3.4)
     try:
-        run_pass(quad, prog_display, target, {"u_src": tex}, view.uniforms(flip_y=0))
+        textures = {"u_src": tex}
+        if original is not None:
+            textures["u_original"] = original
+        run_pass(quad, prog_display, target, textures, view.uniforms(flip_y=0))
         return target.read()[..., :3].copy()
     finally:
         target.release()
