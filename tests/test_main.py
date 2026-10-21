@@ -53,13 +53,40 @@ def test_texture_limit_is_image_error():
 
 
 def test_window_size_leaves_room_for_full_state_title():
-    assert app.window_size((640, 480)) == (app.MIN_WINDOW_WIDTH, 480)
-    assert app.window_size((1920, 1080)) == (1920, 1080)
+    # Panel lateral + imagen a su derecha; el alto nunca baja de PANEL_MIN_HEIGHT.
+    assert app.window_size((640, 480)) == (app.PANEL_WIDTH + 640, app.PANEL_MIN_HEIGHT)
+    assert app.window_size((1920, 1080)) == (app.PANEL_WIDTH + 1920, 1080)
 
 
-def test_centered_viewport():
-    assert app.centered_viewport((1280, 480), (640, 480)) == (320, 0, 640, 480)
-    assert app.centered_viewport((640, 640), (640, 480)) == (0, 80, 640, 480)
+def test_panel_min_height_fits_tallest_panel():
+    """PANEL_MIN_HEIGHT cubre el panel más alto (modo Canny) con margen inferior.
+
+    Se reconstruye el desglose de alturas del panel tal como lo acumula la variable
+    `y` en App._update_status_texture, para el estado MÁS ALTO (Canny: 3 filas de
+    parámetros). Si alguien añade secciones o filas y supera el mínimo, este test
+    falla antes de que CONTROLES quede recortado en pantalla.
+    """
+    y = 18  # margen superior inicial
+    y += 24 + 30  # título en dos líneas
+    # Cada sección: header (+20) y luego sus valores/filas; gap() añade 12 al final.
+    y += 20 + 22 + 22 + 12  # IMAGEN: header + nombre + tamaño
+    y += 20 + 22 + 22 + 12  # MODO: header + nombre del modo + resumen
+    canny_param_rows = 3  # Sigma, Alto/bajo, Método (el modo con más filas)
+    y += 20 + canny_param_rows * 20 + 12  # PARÁMETROS
+    y += 20 + 22 + 4 * 18 + 12  # BORDE: header + activo + leyenda de 4 bordes
+    y += 20 + 22 + 12  # LUPA: header + etiqueta
+    y += 20 + 3 * 18  # CONTROLES: header + 3 líneas de atajos
+
+    estimated_panel_height = y
+    bottom_margin = 20  # holgura mínima bajo el contenido
+    assert app.PANEL_MIN_HEIGHT >= estimated_panel_height + bottom_margin
+
+
+def test_image_viewport():
+    # Imagen pegada a la derecha del panel, centrada en vertical si sobra alto.
+    assert app.image_viewport((app.PANEL_WIDTH + 640, 520), (640, 480)) == (app.PANEL_WIDTH, 20, 640, 480)
+    # Imagen tan alta como la ventana: sin desplazamiento vertical.
+    assert app.image_viewport((app.PANEL_WIDTH + 640, 720), (640, 720)) == (app.PANEL_WIDTH, 0, 640, 720)
 
 
 def test_default_image_comes_from_settings():

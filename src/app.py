@@ -17,7 +17,7 @@ from pathlib import Path
 import glfw
 import moderngl
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from src import benchmark, capture, experiments, kernels, state as st
 from src.config import SETTINGS_PATH, ConfigError, SettingsWatcher, load_settings
@@ -28,9 +28,22 @@ from src.shader_loader import load_program
 from src.texture_loader import ImageLoadError, create_texture, load_image
 
 APP_NAME = st.APP_NAME
-# Ancho mínimo para que el título, que contiene el estado completo, no quede
-# recortado en imágenes pequeñas. La imagen sigue procesándose a su resolución.
-MIN_WINDOW_WIDTH = 1280
+# Panel lateral único a la izquierda de ancho fijo; la imagen va pegada a su
+# derecha, sin reescalar (R3.x). PANEL_MIN_HEIGHT garantiza que todas las
+# secciones del panel quepan aunque la imagen sea más baja.
+PANEL_WIDTH = 340
+# El contenido del panel (título + Imagen + Modo + Parámetros + Borde con la
+# leyenda de 4 bordes + Lupa + Controles) mide ~570 px en el modo más alto (Canny,
+# con 3 filas de parámetros). 640 lo cubre con ~70 px de holgura inferior para que
+# la sección CONTROLES y el marco de la imagen nunca queden recortados.
+PANEL_MIN_HEIGHT = 640
+# Descripciones cortas de cada modo de borde para la leyenda del panel.
+EDGE_DESCRIPTIONS = {
+    st.BORDER_ZERO: "fuera=0",
+    st.BORDER_REPLICATE: "repite el borde",
+    st.BORDER_REFLECT: "espeja",
+    st.BORDER_WRAP: "da la vuelta",
+}
 EDGE_COLORS = {
     st.BORDER_ZERO: (238, 92, 92, 255),
     st.BORDER_REPLICATE: (101, 210, 140, 255),
@@ -98,21 +111,47 @@ class GLContextError(Exception):
 
 
 def window_size(image_size: tuple[int, int]) -> tuple[int, int]:
-    """Devuelve el tamaño de ventana, reservando espacio para el título de estado."""
+    """Tamaño de ventana: panel lateral + imagen a su derecha, sin reescalar (R3.x).
+
+    El alto es el de la imagen pero nunca menor que PANEL_MIN_HEIGHT, para que el
+    panel de parámetros quepa completo aunque la imagen sea baja.
+    """
     width, height = image_size
-    return max(width, MIN_WINDOW_WIDTH), height
+    return PANEL_WIDTH + width, max(height, PANEL_MIN_HEIGHT)
 
 
-def centered_viewport(container_size: tuple[int, int], content_size: tuple[int, int]) -> tuple[int, int, int, int]:
-    """Devuelve el rectángulo centrado donde se dibuja la imagen, en píxeles."""
-    container_w, container_h = container_size
-    content_w, content_h = content_size
+def image_viewport(window_size: tuple[int, int], image_size: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Rectángulo (x, y, w, h) donde se dibuja la imagen a su resolución exacta (R3.x).
+
+    x = PANEL_WIDTH: la imagen va pegada a la derecha del panel. Si la ventana es
+    más alta que la imagen, se centra verticalmente; nunca se reescala.
+    """
+    _, win_h = window_size
+    image_w, image_h = image_size
     return (
-        max(0, (container_w - content_w) // 2),
-        max(0, (container_h - content_h) // 2),
-        content_w,
-        content_h,
+        PANEL_WIDTH,
+        max(0, (win_h - image_h) // 2),
+        image_w,
+        image_h,
     )
+
+
+# Paleta del panel (RGBA). Fondo sólido, encabezados tenues y valores claros.
+PANEL_BG = (24, 28, 40, 242)
+PANEL_HEADER = (120, 134, 158, 255)
+PANEL_VALUE = (226, 233, 242, 255)
+PANEL_TITLE = (247, 203, 108, 255)
+PANEL_DIM = (150, 160, 176, 255)
+
+
+def _load_font(size: int):
+    """Fuente TrueType del tamaño pedido; si no hay ninguna, la de PIL por defecto."""
+    for name in ("DejaVuSans.ttf", "arial.ttf", "segoeui.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 
 def _warn(msg: str) -> None:
@@ -232,7 +271,15 @@ class App:
         self.status_tex = self._keep(ctx.texture(self.window_size, 4, dtype="f1"))
         self.status_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self.timer = benchmark.GpuTimer(ctx)
+        self._init_fonts()
         self._update_status_texture()
+
+    def _init_fonts(self) -> None:
+        """Fuentes del panel (R16.3). Se cargan una vez; load_default si truetype falla."""
+        self.font_title = _load_font(18)
+        self.font_header = _load_font(13)
+        self.font_value = _load_font(15)
+        self.font_small = _load_font(12)
 
     def _keep(self, obj):
         self._resources.append(obj)
@@ -253,7 +300,7 @@ class App:
         píxeles de ventana, que coincide con el sistema fila 0 arriba de display.frag.
         No dibuja: set_cursor marca dirty solo si la lupa está activa y el bucle redibuja."""
         w, h = self.size
-        offset_x, offset_y, _, _ = centered_viewport(self.window_size, self.size)
+        offset_x, offset_y, _, _ = image_viewport(self.window_size, self.size)
         cx = min(w - 1, max(0, int(x) - offset_x))
         cy = min(h - 1, max(0, int(y) - offset_y))
         old = self.state
@@ -357,41 +404,149 @@ class App:
     def _title(self) -> str:
         return st.title(self.state, self.image_path.name, self.size, self.last_gpu_ms)
 
+    def _mode_summary(self) -> str:
+        """Dato principal del modo activo, para la sección MODO del panel (R16.3)."""
+        s = self.state
+        if s.mode == st.MODE_KERNEL:
+            return st.kernel_name(s)
+        if s.mode == st.MODE_BLUR:
+            return f"σ={s.sigma:g} {kernels.PROFILE_NAMES[s.profile]}"
+        if s.mode == st.MODE_UNSHARP:
+            return f"α={s.alpha:.2f} σ={s.sigma:g}"
+        return f"k{s.stage}/{st.STAGE_COUNT}: {st.stage_label(s)}"
+
+    def _param_rows(self) -> list[tuple[str, str]]:
+        """Pares (etiqueta, valor) de la sección PARAMETROS según el modo (R16.3)."""
+        s = self.state
+        if s.mode == st.MODE_KERNEL:
+            return [
+                ("Normalización", st.normalize_label(s)),
+                ("Vista", kernels.MAP_NAMES[s.display_map]),
+            ]
+        if s.mode == st.MODE_BLUR:
+            return [
+                ("Sigma", f"{s.sigma:g}"),
+                ("Perfil", kernels.PROFILE_NAMES[s.profile]),
+                ("Método", st.method_label(s)),
+            ]
+        if s.mode == st.MODE_UNSHARP:
+            return [
+                ("Alfa", f"{s.alpha:.2f}"),
+                ("Sigma", f"{s.sigma:g}"),
+                ("Método", st.method_label(s)),
+            ]
+        return [
+            ("Sigma", f"{s.canny_sigma:g}"),
+            ("Alto / bajo", f"{s.high:.2f} / {s.low:.2f}"),
+            ("Método", st.method_label(s)),
+        ]
+
     def _update_status_texture(self) -> None:
-        """Actualiza el HUD transparente que ocupa solo las franjas laterales."""
+        """Dibuja el panel lateral izquierdo y el marco de la imagen (R16.3).
+
+        El panel es una textura RGBA sólida en x ∈ [0, PANEL_WIDTH); el resto queda
+        transparente para que status.frag solo tape el área del panel. El marco del
+        color del borde activo rodea la imagen sin invadir su interior.
+        """
         width, height = self.window_size
         image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        left, top, content_width, content_height = centered_viewport(self.window_size, self.size)
-        panel_color = (35, 42, 61, 235)
         accent = EDGE_COLORS[self.state.border]
-        text_color = (222, 231, 240, 255)
-        draw.rectangle(
-            (left, top, left + content_width - 1, top + content_height - 1),
-            outline=accent,
-            width=3,
-        )
-        if left:
-            draw.rectangle((0, 0, left - 1, height - 1), fill=panel_color)
-            draw.rectangle((left - 2, 0, left - 1, height - 1), fill=accent)
-        right = width - left - content_width
-        if right:
-            right_start = left + content_width
-            draw.rectangle((right_start, 0, width - 1, height - 1), fill=panel_color)
-            draw.rectangle((right_start, 0, right_start + 1, height - 1), fill=accent)
-        lines = [
-            "IMAGEN",
-            self.image_path.name,
-            f"{self.size[0]} x {self.size[1]}",
-            "",
-            "MODO",
-            st.MODE_NAMES.get(self.state.mode, self.state.mode).upper(),
-            "",
-            "BORDE",
-            st.BORDER_NAMES[self.state.border].upper(),
+
+        # Fondo del panel y filo de acento en su borde derecho.
+        panel_w = min(PANEL_WIDTH, width)
+        draw.rectangle((0, 0, panel_w - 1, height - 1), fill=PANEL_BG)
+        draw.rectangle((panel_w - 2, 0, panel_w - 1, height - 1), fill=accent)
+
+        margin = 16
+        y = 18
+
+        def header(text: str) -> None:
+            nonlocal y
+            draw.text((margin, y), text.upper(), font=self.font_header, fill=PANEL_HEADER)
+            y += 20
+
+        def value(text: str, fill=PANEL_VALUE, font=None) -> None:
+            nonlocal y
+            draw.text((margin, y), text, font=font or self.font_value, fill=fill)
+            y += 22
+
+        def gap(px: int = 12) -> None:
+            nonlocal y
+            y += px
+
+        # Título.
+        draw.text((margin, y), "LABORATORIO DE", font=self.font_title, fill=PANEL_TITLE)
+        y += 24
+        draw.text((margin, y), "CONVOLUCIÓN", font=self.font_title, fill=PANEL_TITLE)
+        y += 30
+
+        # IMAGEN.
+        header("Imagen")
+        value(self.image_path.name)
+        value(f"{self.size[0]} x {self.size[1]}", fill=PANEL_DIM, font=self.font_small)
+        gap()
+
+        # MODO.
+        header("Modo")
+        value(st.MODE_NAMES.get(self.state.mode, self.state.mode))
+        value(self._mode_summary(), fill=PANEL_DIM, font=self.font_small)
+        gap()
+
+        # PARAMETROS.
+        header("Parámetros")
+        for label, val in self._param_rows():
+            draw.text((margin, y), label, font=self.font_small, fill=PANEL_HEADER)
+            draw.text((margin + 150, y), val, font=self.font_small, fill=PANEL_VALUE)
+            y += 20
+        gap()
+
+        # BORDE: modo activo y leyenda de los cuatro modos.
+        header("Borde")
+        value(st.BORDER_NAMES[self.state.border].upper(), fill=accent)
+        for border in range(len(st.BORDER_NAMES)):
+            color = EDGE_COLORS[border]
+            active = border == self.state.border
+            sw_top = y + 3
+            draw.rectangle((margin, sw_top, margin + 11, sw_top + 11), fill=color)
+            prefix = "> " if active else "  "
+            name = st.BORDER_NAMES[border]
+            desc = EDGE_DESCRIPTIONS[border]
+            text_fill = PANEL_VALUE if active else PANEL_DIM
+            draw.text((margin + 20, y), f"{prefix}{name}", font=self.font_small, fill=text_fill)
+            draw.text((margin + 110, y), desc, font=self.font_small, fill=text_fill)
+            y += 18
+        gap()
+
+        # LUPA.
+        header("Lupa")
+        value(st.lens_label(self.state), fill=PANEL_DIM, font=self.font_small)
+        gap()
+
+        # CONTROLES (resumen; H muestra la ayuda completa en consola).
+        header("Controles")
+        controls = [
+            "1-8 kernel   B borde   M modo",
+            "C canny   L lupa   G captura",
+            "H ayuda completa",
         ]
-        if left >= 180:
-            draw.multiline_text((12, 16), "\n".join(lines), fill=text_color, spacing=5)
+        for line in controls:
+            draw.text((margin, y), line, font=self.font_small, fill=PANEL_DIM)
+            y += 18
+
+        # Alto realmente ocupado por el contenido del panel; sirve para verificar
+        # (en los tests) que PANEL_MIN_HEIGHT lo cubre con holgura inferior.
+        self._panel_content_height = y
+
+        # Marco fino del color del borde alrededor del área de imagen (sin taparla).
+        vx, vy, vw, vh = image_viewport(self.window_size, self.size)
+        frame_w = 2
+        draw.rectangle(
+            (vx - frame_w, vy - frame_w, vx + vw + frame_w - 1, vy + vh + frame_w - 1),
+            outline=accent,
+            width=frame_w,
+        )
+
         self.status_tex.write(np.asarray(image, dtype=np.uint8).tobytes())
 
     def render(self) -> bool:
@@ -400,10 +555,12 @@ class App:
             return False
         # Tiempo de GPU de las pasadas de procesado, sin la de pantalla (R14.5).
         (tex, view), self.last_gpu_ms = self.timer.measure(lambda: self.processor.run(self.state))
-        # La imagen conserva su tamaño y queda centrada; el resto es el fondo.
+        # La imagen conserva su tamaño y va pegada a la derecha del panel; el resto
+        # es un fondo gris muy oscuro.
+        viewport = image_viewport((fw, fh), self.size)
         self.ctx.screen.use()
         self.ctx.viewport = (0, 0, fw, fh)
-        self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+        self.ctx.clear(0.07, 0.08, 0.10, 1.0)
         # u_original = textura de entrada para la lupa (R21). No dispara la aserción
         # anti-feedback: el destino es self.screen.texture, distinto de input_tex.
         run_pass(
@@ -411,8 +568,8 @@ class App:
             self.prog_display,
             self.screen,
             {"u_src": tex, "u_original": self.input_tex},
-            view.uniforms(flip_y=1, origin=centered_viewport((fw, fh), self.size)[:2]),
-            viewport=centered_viewport((fw, fh), self.size),
+            view.uniforms(flip_y=1, origin=viewport[:2]),
+            viewport=viewport,
         )
         self._update_status_texture()
         self.ctx.enable(moderngl.BLEND)

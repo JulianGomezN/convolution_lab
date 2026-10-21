@@ -51,7 +51,11 @@ def test_version_330_core(path):
 
 
 @pytest.mark.parametrize(
-    "path", [p for p in SHADERS if p.suffix == ".frag" and p.name != "display.frag"], ids=lambda p: p.name
+    # display.frag y status.frag muestran una textura 1:1 (el HUD en status.frag) y no
+    # leen vecinos, así que están exceptuados del fetch común de modos de borde.
+    "path",
+    [p for p in SHADERS if p.suffix == ".frag" and p.name not in ("display.frag", "status.frag")],
+    ids=lambda p: p.name,
 )
 def test_neighbor_reads_go_through_common_fetch(path):
     """Los modos de borde viven solo en common.glsl (R10.3): ningún .frag de proceso llama a texelFetch."""

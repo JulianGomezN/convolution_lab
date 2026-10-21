@@ -55,7 +55,7 @@ class View:
         """
         return {
             "u_flip_y": flip_y,
-            "u_viewport_origin": origin,
+            "u_img_origin": origin,
             "u_channel": self.channel,
             "u_map": self.map,
             "u_gain": self.gain,
