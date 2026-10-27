@@ -9,6 +9,12 @@ from __future__ import annotations
 
 import moderngl
 import pytest
+from hypothesis import settings
+
+# Perfil común de Hypothesis: 100 ejemplos, sin base de datos de ejemplos
+# (no crea `.hypothesis/`) y sin deadline (la GPU/IO puede tardar).
+settings.register_profile("proyecto", max_examples=100, database=None, deadline=None)
+settings.load_profile("proyecto")
 
 _state: dict = {}
 

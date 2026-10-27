@@ -97,6 +97,105 @@ Edita `config\settings.json` (matriz 3x3, fila superior primero) y pulsa 0. Con 
 
 G guarda un PNG del tamaño de la imagen con el mapeo aplicado, con nombres del tipo `results\20250307-090502_kernel_k5-sobel-gx_wrap_norm-si_vista-abs.png` (fecha_modo_kernel o etapa_borde_parámetros). La carpeta se crea si falta y la ruta se imprime en consola. La captura se dibuja con el mismo `display.frag` que la pantalla, así que es idéntica a lo que se ve.
 
+## Vídeo
+
+Además de imágenes fijas, la app acepta animaciones y vídeos con `--video RUTA`. El vídeo es solo otra fuente de entrada: cada frame se sube con un único `texture.write` a la misma textura de entrada W×H y pasa por los mismos shaders, el panel, la lupa y las capturas. La CPU solo decodifica; no filtra, no reescala ni opera entre píxeles vecinos. Se ignora el audio.
+
+### Instalación opcional
+
+Los GIF, APNG y WebP animados se leen con Pillow y no necesitan nada más. Para MP4, AVI, MKV, MOV y WebM hay que instalar `requirements-video.txt` después de `requirements.txt`. El modo imagen no lo necesita.
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+# Solo para vídeo real (MP4, AVI, MKV, MOV, WebM):
+.venv\Scripts\python.exe -m pip install -r requirements-video.txt
+```
+
+Versiones fijadas en `requirements-video.txt`: imageio==2.38.1 e imageio-ffmpeg==0.6.0. Las ruedas de imageio-ffmpeg para Windows incluyen el ejecutable de ffmpeg, así que no hace falta instalarlo aparte. hypothesis, que usan los tests de propiedades, está en `requirements-dev.txt`.
+
+| Backend | Extensiones | Requiere `requirements-video.txt` |
+|---|---|---|
+| Pillow | .gif .png .apng .webp | No |
+| imageio-ffmpeg | .mp4 .avi .mkv .mov .webm | Sí |
+
+Las extensiones se comparan sin distinguir mayúsculas. Un PNG estático abierto con `--video` se trata como un vídeo de 1 frame.
+
+### Ejecución
+
+```powershell
+# Genera la animación de prueba assets\videos\demo.gif (320x240, 60 frames de 50 ms)
+.venv\Scripts\python.exe tools\make_test_video.py
+
+# Reproduce la animación (solo Pillow, sin requirements-video.txt)
+.venv\Scripts\python.exe main.py --video assets\videos\demo.gif
+
+# Benchmark y experimentos sobre el frame 0 del vídeo
+.venv\Scripts\python.exe main.py --benchmark --video assets\videos\demo.gif
+.venv\Scripts\python.exe main.py --experiments --video assets\videos\demo.gif
+```
+
+El generador es determinista: dos ejecuciones dan los mismos frames y el mismo contenido de píxeles. La animación dura 3 s (20 fps) e incluye la "F" de `orientacion.png` desplazándose, una barra que gira, un marcador rojo fijo y un contador binario en la fila inferior que identifica el frame.
+
+`--video` y `--image` son excluyentes. `--image` no cambia: con un GIF animado carga el primer frame como imagen fija, y con un `.mp4` termina con código 2 y pide usar `--video RUTA`.
+
+Al abrir el vídeo, la consola muestra una línea como `Vídeo: demo.gif | 320x240 | 60 frames | 20.00 fps | backend Pillow`. El vídeo arranca reproduciéndose y con el bucle activado, a su velocidad real: si la GPU o el decodificado van por detrás, se saltan frames en lugar de ralentizar.
+
+| Tecla | Acción |
+|---|---|
+| Espacio | Pausa / reproducir (en pausa en el último frame sin bucle, vuelve al frame 0) |
+| . (punto) | Pausa y avanza un frame |
+| , (coma) | Pausa y retrocede un frame |
+| Inicio | Vuelve al frame 0 sin cambiar la pausa ni el bucle |
+| O | Bucle on/off |
+
+Las demás teclas funcionan igual que con una imagen, y los cambios de filtro se ven en vivo. Con una imagen fija estas cinco teclas no hacen nada. Punto y coma están en la misma posición en los teclados español y estadounidense.
+
+El panel añade una sección "Vídeo" con el frame actual (`frame 12/240`, base 0, o `frame 12/?` si el total es desconocido), el instante de inicio del frame (`0.40 s`), los FPS nominales y efectivos (el efectivo muestra "—" en pausa o durante el primer segundo), "Reproduciendo" o "En pausa" y "bucle: sí/no". El título añade el frame y "pausa" o "reproduciendo". Con una imagen fija el panel y el título no cambian.
+
+Las capturas (G) de un vídeo llevan el índice del frame con 5 dígitos, por ejemplo `results\20250307-090502_kernel_k5-sobel-gx_wrap_norm-si_vista-abs_f00012.png`. Guardar no pausa la reproducción.
+
+`--benchmark` y `--experiments` aceptan `--video`, decodifican solo el frame 0 y lo usan como imagen de entrada. Los PNG de los experimentos son los mismos que con `--image`; `benchmark_<fecha>.csv` y `manifest.csv` añaden las columnas `video` (ruta) y `frame` (0).
+
+### Sin el backend de vídeo
+
+Si se abre un `.mp4`, `.avi`, `.mkv`, `.mov` o `.webm` sin haber instalado `requirements-video.txt`, la app no crea la ventana y termina con código 2. La consola muestra algo así:
+
+```text
+Error de vídeo: No se pudo abrir el vídeo.
+Ruta: assets\videos\clip.mp4
+Motivo: falta(n) imageio, imageio-ffmpeg; instálalo(s) con pip install -r requirements-video.txt (.venv\Scripts\python.exe -m pip install -r requirements-video.txt)
+```
+
+Se resuelve con:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-video.txt
+```
+
+Los demás errores de apertura (ruta inexistente o que no es un archivo, extensión no admitida, primer frame ilegible o tamaño mayor que GL_MAX_TEXTURE_SIZE) también empiezan por "Error de vídeo:" y terminan con código 2. Las imágenes y las animaciones GIF, APNG y WebP siguen funcionando sin imageio, que no se importa al arrancar.
+
+### Dependencia opcional y licencias
+
+El requisito R1.4 del spec original (solo moderngl, glfw, Pillow y numpy) se relaja únicamente para esta dependencia opcional. Sin `requirements-video.txt`, el proyecto cumple R1.4 tal cual y `requirements.txt` sigue teniendo esas cuatro dependencias.
+
+- imageio: licencia BSD-2-Clause.
+- imageio-ffmpeg: licencia BSD-2-Clause; el binario de ffmpeg que incluye se distribuye con licencia LGPL/GPL.
+
+### Supuestos
+
+- V1. Pillow siempre y el backend de vídeo como opción, con imageio e imageio-ffmpeg fijados en `requirements-video.txt`, separado de `requirements.txt`. R1.4 se relaja solo para esta dependencia.
+- V2. El vídeo se abre con `--video RUTA`, excluyente con `--image`. `--image` no cambia: con un GIF animado carga el primer frame como imagen fija.
+- V3. Se ignora el audio.
+- V4. El tamaño W×H es el del primer frame y es constante. Pillow compone cada frame de la animación sobre el lienzo completo.
+- V5. Si el archivo no declara FPS válidos (≤ 0, no finitos o > 240), se usan 25 fps. En animaciones se usa la duración de cada frame; las duraciones ≤ 0 ms cuentan como 100 ms, igual que en los navegadores.
+- V6. La reproducción sigue el reloj de pared: si va por detrás, se saltan frames en vez de ralentizar. Los frames saltados se decodifican pero no se suben a la GPU.
+- V7. Mientras se reproduce, se redibuja cada vez que cambia el frame actual. En pausa se vuelve al render bajo demanda.
+- V8. Teclas nuevas: Espacio, punto, coma, Inicio y O. No chocan con las existentes y punto y coma están en el mismo sitio en los teclados ES y US.
+- V9. El vídeo arranca reproduciéndose con el bucle activado. No hay control de velocidad.
+- V10. `--benchmark` y `--experiments` aceptan `--video` y usan el frame 0 como imagen de entrada.
+- V11. No se garantiza tiempo real por encima de 1920×1080 a 30 fps. El límite duro sigue siendo GL_MAX_TEXTURE_SIZE; el FPS efectivo del panel deja ver el coste de cada modo.
+- V12. Retroceder un frame con el backend de vídeo puede requerir reabrir el archivo y avanzar hasta el índice pedido, sin latencia máxima fijada, porque ffmpeg no ofrece acceso aleatorio exacto por frame en todos los contenedores.
+
 ## Reproducción de los experimentos
 
 `main.py --experiments` genera todo en una carpeta nueva `results\experimentos_<fecha>\`. `manifest.csv` recoge los parámetros de cada archivo: experimento, modo, kernel o etapa, borde, σ, perfil, α, umbrales y método. E2, E3 y E5 usan el borde replicate, que no oscurece el marco; E1 recorre los 4. El resto de parámetros son los valores por defecto (normalización activa, σ de Canny 1.4, umbral alto 0.3 y bajo 0.12, separable).

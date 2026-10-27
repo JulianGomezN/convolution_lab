@@ -5,6 +5,7 @@ from datetime import datetime
 
 import numpy as np
 import pytest
+from hypothesis import given, strategies as hyp
 from PIL import Image
 
 from src import app as app_mod, capture, kernels, state as st
@@ -60,6 +61,37 @@ def test_all_states_give_valid_windows_names():
     for s in states:
         name = capture.capture_name(s, NOW)
         assert name.isascii() and not re.search(r'[<>:"/\\|?*\s]', name), name
+
+
+_app_states = hyp.builds(
+    AppState,
+    mode=hyp.sampled_from([st.MODE_KERNEL, st.MODE_BLUR, st.MODE_UNSHARP, st.MODE_CANNY]),
+    kernel_id=hyp.sampled_from(list(kernels.PRESETS) + ["0"]),
+    normalize=hyp.booleans(),
+    display_map=hyp.sampled_from(range(len(capture.MAP_SLUGS))),
+    border=hyp.sampled_from(range(len(st.BORDER_NAMES))),
+    sigma=hyp.floats(0.5, 20.0, allow_nan=False),
+    canny_sigma=hyp.floats(0.5, 10.0, allow_nan=False),
+    profile=hyp.sampled_from(list(kernels.PROFILE_NAMES)),
+    separable=hyp.booleans(),
+    alpha=hyp.floats(0.0, 5.0, allow_nan=False),
+    stage=hyp.integers(1, st.STAGE_COUNT),
+    high=hyp.floats(st.HIGH_MIN, st.HIGH_MAX, allow_nan=False),
+)
+_datetimes = hyp.datetimes(min_value=datetime(2000, 1, 1), max_value=datetime(2099, 12, 31))
+
+
+# Feature: soporte-video, Property 16: Round trip del sufijo de frame de las capturas
+@given(state=_app_states, now=_datetimes, k=hyp.integers(min_value=0, max_value=10**8))
+def test_capture_name_frame_suffix_round_trip(state, now, k):
+    """**Validates: Requirements 10.2, 10.7**"""
+    base = capture.capture_name(state, now)
+    name = capture.capture_name(state, now, k)
+    assert name.endswith(f"_f{k:05d}.png")
+    m = re.search(r"_f(\d+)\.png$", name)
+    assert m is not None and len(m.group(1)) >= 5  # ceros hasta 5 dígitos, sin truncar (R10.2)
+    assert int(m.group(1)) == k
+    assert name[: m.start()] + ".png" == base  # sin sufijo: el nombre de siempre (R10.7)
 
 
 def test_unique_path(tmp_path):

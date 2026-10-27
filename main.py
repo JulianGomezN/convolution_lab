@@ -1,6 +1,9 @@
-"""Punto de entrada: python main.py [--image RUTA] [--benchmark | --experiments] [--quick].
+"""Punto de entrada:
+python main.py [--image RUTA | --video RUTA] [--benchmark | --experiments] [--quick].
 
-Códigos de salida: 0 normal, 1 error inesperado, 2 error de imagen,
+--video reproduce un vídeo o animación (excluyente con --image).
+
+Códigos de salida: 0 normal, 1 error inesperado, 2 error de imagen o de vídeo,
 3 error de OpenGL/GLFW, 4 error de shader, 130 Ctrl+C.
 """
 
@@ -16,6 +19,7 @@ from src import app
 from src.app import GLContextError
 from src.shader_loader import ShaderError
 from src.texture_loader import ImageLoadError
+from src.video import FFMPEG_SUFFIXES, PILLOW_SUFFIXES, VIDEO_SUFFIXES, VideoOpenError
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.json"
@@ -67,10 +71,19 @@ def build_parser() -> argparse.ArgumentParser:
         prog="main.py",
         description="Laboratorio interactivo de máscaras de convolución (OpenGL 3.3 core).",
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
         "--image",
         metavar="RUTA",
         help="imagen a cargar (por defecto: default_image de config/settings.json)",
+    )
+    pillow = ", ".join(s for s in VIDEO_SUFFIXES if s in PILLOW_SUFFIXES)
+    ffmpeg = ", ".join(s for s in VIDEO_SUFFIXES if s in FFMPEG_SUFFIXES)
+    source.add_argument(
+        "--video",
+        metavar="RUTA",
+        help=f"vídeo o animación a reproducir (RUTA); excluyente con --image. "
+        f"Extensiones: {pillow} (Pillow) y {ffmpeg} (requieren requirements-video.txt)",
     )
     batch = parser.add_mutually_exclusive_group()
     batch.add_argument(
@@ -94,14 +107,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    image_path = Path(args.image) if args.image else default_image()
+    if args.video is not None:
+        path = Path(args.video)
+    else:
+        path = Path(args.image) if args.image else default_image()
 
     try:
+        # Con --video, el benchmark y los experimentos usan el frame 0 (R11).
+        is_video = args.video is not None
         if args.benchmark:
-            return app.run_benchmark(image_path, quick=args.quick)
+            return app.run_benchmark(path, quick=args.quick, video=is_video)
         if args.experiments:
-            return app.run_experiments(image_path, quick=args.quick)
-        return app.run(image_path)
+            return app.run_experiments(path, quick=args.quick, video=is_video)
+        if args.video is not None:
+            return app.run_video(path)
+        return app.run(path)
+    except VideoOpenError as exc:  # subclase de ImageLoadError: va antes
+        print(f"Error de vídeo: {exc}", file=sys.stderr)
+        return EXIT_IMAGE
     except ImageLoadError as exc:
         print(f"Error de imagen: {exc}", file=sys.stderr)
         return EXIT_IMAGE

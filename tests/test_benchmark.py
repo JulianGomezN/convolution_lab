@@ -192,3 +192,74 @@ def test_benchmark_cli_subprocess(ctx, tmp_path):
     finally:
         for p in created:
             p.unlink()
+
+
+# --- Vídeo (R11.1, R11.3, R11.4, R11.6, R13.11) -------------------------------
+
+
+def _make_gif(path: Path, size=(16, 12), n=3) -> Path:
+    """Animación pequeña con frames distintos (W×H = size)."""
+    rng = np.random.default_rng(43)
+    frames = [Image.fromarray(rng.integers(0, 256, size=(size[1], size[0], 3), dtype=np.uint8)) for _ in range(n)]
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    return path
+
+
+def _results_listing() -> set:
+    results = ROOT / "results"
+    return set(results.rglob("*")) if results.exists() else set()
+
+
+def test_benchmark_and_save_extra_columns(ctx, processor, tmp_path):
+    extra = {"video": str(tmp_path / "anim.gif"), "frame": 0}
+    path = benchmark.benchmark_and_save(
+        ctx, processor, quick=True, csv_path=tmp_path / "v.csv", sigmas=(1.0,), extra_columns=extra
+    )
+    with path.open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert tuple(rows[0]) == benchmark.CSV_COLUMNS + benchmark.VIDEO_COLUMNS
+    assert len(rows) == 2
+    assert all(r["video"] == extra["video"] and r["frame"] == "0" for r in rows)
+
+    plain = benchmark.benchmark_and_save(ctx, processor, quick=True, csv_path=tmp_path / "i.csv", sigmas=(1.0,))
+    with plain.open(encoding="utf-8") as f:
+        assert tuple(next(csv.reader(f))) == benchmark.CSV_COLUMNS
+
+
+@pytest.mark.parametrize("batch", ["--benchmark", "--experiments"])
+@pytest.mark.parametrize("name", ["no_existe.gif", "archivo.txt"])
+def test_video_batch_open_error_exits_2(tmp_path, capsys, batch, name):
+    """Ruta inexistente o extensión no admitida: código 2 y nada nuevo en results/ (R11.6)."""
+    target = tmp_path / name
+    if name.endswith(".txt"):
+        target.write_text("no es un vídeo", encoding="utf-8")
+    before = _results_listing()
+    assert main.main(["--video", str(target), batch]) == 2
+    assert _results_listing() == before
+    err = capsys.readouterr().err
+    assert "Error de vídeo" in err and "Traceback" not in err
+
+
+def test_video_benchmark_cli_subprocess(ctx, tmp_path):
+    """--video <gif> --benchmark --quick: código 0, ruta y frame 0 en consola y en cada fila (R11.1, R11.4)."""
+    gif = _make_gif(tmp_path / "anim.gif")
+    results = ROOT / "results"
+    before = set(results.glob("benchmark_*.csv"))
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "main.py"), "--video", str(gif), "--benchmark", "--quick"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT, timeout=300,
+    )
+    created = set(results.glob("benchmark_*.csv")) - before
+    try:
+        assert proc.returncode == 0, proc.stderr
+        assert str(gif) in proc.stdout and "| frame 0" in proc.stdout
+        assert len(created) == 1
+        with next(iter(created)).open(encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert tuple(rows[0]) == benchmark.CSV_COLUMNS + benchmark.VIDEO_COLUMNS
+        assert len(rows) == 2 * len(benchmark.SIGMAS)
+        assert all(r["video"] == str(gif) and r["frame"] == "0" for r in rows)
+        assert {(r["W"], r["H"]) for r in rows} == {("16", "12")}
+    finally:
+        for p in created:
+            p.unlink()

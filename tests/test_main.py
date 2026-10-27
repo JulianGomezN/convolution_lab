@@ -169,3 +169,143 @@ def test_old_opengl_version_exits_3(monkeypatch, capsys):
     assert "Se requiere OpenGL 3.3 y el contexto ofrece 320" in err
     assert "Traceback" not in err
     assert released == [True]  # el contexto se libera aunque falle la validación
+
+
+# --- soporte de vídeo: CLI y panel (R2.3, R2.5, R2.7, R3.1–R3.4, R8.9, R13.6) ---
+
+import types
+from dataclasses import replace
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+from src import state as st
+from src.video import VIDEO_SUFFIXES
+
+
+@pytest.fixture
+def no_window(monkeypatch):
+    """Falla el test si se intenta crear la ventana (App.init o glfw.init)."""
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("no se debe crear ventana ante un error de apertura")
+
+    monkeypatch.setattr(app.App, "init", forbidden)
+    monkeypatch.setattr(app.glfw, "init", forbidden)
+
+
+def test_video_and_image_are_mutually_exclusive(capsys):
+    """R2.3: --video con --image → código 2 y mensaje de argparse en español."""
+    with pytest.raises(SystemExit) as info:
+        main.main(["--video", "clip.gif", "--image", "foto.png"])
+    assert info.value.code == 2
+    err = capsys.readouterr().err
+    assert "uso:" in err
+    assert "no se permite junto con el argumento" in err
+
+
+def test_help_mentions_video_and_extensions(monkeypatch, capsys):
+    """R2.7: la ayuda menciona --video RUTA, --image y las 9 extensiones."""
+    monkeypatch.setenv("COLUMNS", "200")
+    with pytest.raises(SystemExit) as info:
+        main.main(["--help"])
+    assert info.value.code == 0
+    out = " ".join(capsys.readouterr().out.split())  # argparse puede partir líneas
+    assert "--video RUTA" in out and "--image" in out and "RUTA" in out
+    assert len(VIDEO_SUFFIXES) == 9
+    for suffix in VIDEO_SUFFIXES:
+        assert suffix in out, suffix
+
+
+def _truncated_png(path):
+    """PNG con cabecera válida y datos cortados: Image.open funciona, decodificar no."""
+    rng = np.random.default_rng(0)
+    Image.fromarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(path)
+    data = path.read_bytes()
+    path.write_bytes(data[: len(data) // 2])
+    return path
+
+
+@pytest.mark.parametrize(
+    "case, reason",
+    [
+        ("missing", "el archivo no existe"),  # R3.1
+        ("directory", "la ruta no es un archivo"),  # R3.1
+        ("bad_suffix", "no admitida"),  # R3.2
+        ("no_backend", "falta(n) imageio"),  # R3.3
+        ("corrupt_frame0", "no se pudo decodificar el primer frame"),  # R3.4
+    ],
+)
+def test_video_open_errors_exit_2_without_window(case, reason, tmp_path, monkeypatch, capsys, no_window):
+    if case == "missing":
+        path = tmp_path / "no_existe.mp4"
+    elif case == "directory":
+        path = tmp_path / "carpeta.gif"
+        path.mkdir()
+    elif case == "bad_suffix":
+        path = tmp_path / "clip.xyz"
+        path.write_bytes(b"datos")
+    elif case == "no_backend":
+        path = tmp_path / "clip.mp4"
+        path.write_bytes(b"datos")
+        monkeypatch.setitem(sys.modules, "imageio", None)  # import imageio → ImportError
+    else:
+        path = _truncated_png(tmp_path / "roto.png")
+    assert main.main(["--video", str(path)]) == 2
+    err = capsys.readouterr().err
+    assert "Error de vídeo:" in err
+    assert reason in err
+    assert str(path) in err
+    assert "Traceback" not in err
+
+
+def test_image_with_video_suffix_exits_2_without_window(tmp_path, capsys, no_window):
+    """R2.5: --image clip.mp4 → error de imagen que sugiere --video."""
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"datos")
+    assert main.main(["--image", str(path)]) == 2
+    err = capsys.readouterr().err
+    assert "Error de imagen:" in err
+    assert "--video" in err
+    assert "Traceback" not in err
+
+
+def _fake_player(n=12345, k=12345, start=999.99, fps=999.9):
+    """Player falso con lo que leen _draw_panel/_video_rows (valores de máxima longitud)."""
+    timeline = types.SimpleNamespace(n_frames=n, start=lambda index: start)
+    clock = types.SimpleNamespace(timeline=timeline, playing=True, loop=True)
+    return types.SimpleNamespace(
+        clock=clock,
+        shown_index=k,
+        source=types.SimpleNamespace(fps=fps),
+        fps=types.SimpleNamespace(value=lambda now: fps),
+    )
+
+
+def test_panel_min_height_fits_tallest_panel_with_video(monkeypatch):
+    """R8.9, R13.6: el panel con VÍDEO en modo Canny cabe en alto y en ancho."""
+    frame0 = np.zeros((1080, 1920, 4), dtype=np.uint8)
+    video_app = app.App(frame0, Path("animacion_de_prueba_larga.webm"), source=object(), now=lambda: 100.0)
+    video_app.player = _fake_player()
+    video_app.state = replace(video_app.state, mode=st.MODE_CANNY, high=0.99, low_ratio=0.99)
+    video_app._init_fonts()
+
+    lines = []
+    original_text = ImageDraw.ImageDraw.text
+
+    def recording_text(self, xy, text, *args, font=None, **kwargs):
+        lines.append((xy[0], text, font))
+        return original_text(self, xy, text, *args, font=font, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", recording_text)
+    _, content_height = video_app._draw_panel()
+
+    assert content_height + 20 <= app.PANEL_MIN_HEIGHT
+    texts = [text for _, text, _ in lines]
+    assert "1920 x 1080 · frame 12345/12345 · 999.99 s" in texts
+    assert "Reproduciendo · bucle: sí" in texts
+    measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    for x, text, font in lines:
+        assert x < app.PANEL_WIDTH
+        right = x + measure.textlength(text, font=font)
+        assert right <= app.PANEL_WIDTH - 16, (text, right)

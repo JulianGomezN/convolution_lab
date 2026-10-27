@@ -59,9 +59,15 @@ def describe(state: st.AppState) -> str:
     return f"{MODE_SLUGS[state.mode]}_{what}_{border}_{params}"
 
 
-def capture_name(state: st.AppState, now: datetime) -> str:
-    """`AAAAMMDD-HHMMSS_<modo>_<kernel|etapa>_<borde>_<params>.png` (R15.1)."""
-    return f"{now.strftime(TIMESTAMP_FORMAT)}_{describe(state)}.png"
+def capture_name(state: st.AppState, now: datetime, frame_index: int | None = None) -> str:
+    """`AAAAMMDD-HHMMSS_<modo>_<kernel|etapa>_<borde>_<params>.png` (R15.1).
+
+    Con `frame_index` (vídeo) añade `_f<índice>` antes de `.png`, con ceros hasta
+    5 dígitos y sin truncar si el índice es mayor que 99999 (R10.2). Sin él, el
+    nombre de siempre (R10.7).
+    """
+    frame = "" if frame_index is None else f"_f{frame_index:05d}"
+    return f"{now.strftime(TIMESTAMP_FORMAT)}_{describe(state)}{frame}.png"
 
 
 def unique_path(path: Path) -> Path:
@@ -99,11 +105,28 @@ def render_display(
 
 
 def save_png(rgb: np.ndarray, path: Path) -> Path:
-    """Guarda H×W×3 uint8 como PNG, creando la carpeta si falta (R15.2). Lanza CaptureError."""
+    """Guarda H×W×3 uint8 como PNG, creando la carpeta si falta (R15.2). Lanza CaptureError.
+
+    Si la escritura falla a mitad, borra el archivo parcial para no dejar en la
+    carpeta ninguna captura rota (R10.8). Solo se borra si no existía antes de
+    intentar guardar (la ruta suele venir de `unique_path`, así que es nueva).
+    """
     path = Path(path)
+    existed = path.exists()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(np.ascontiguousarray(rgb, dtype=np.uint8)).save(path, format="PNG")
     except (OSError, ValueError) as exc:
+        if not existed:
+            _remove_partial(path)
         raise CaptureError(f"no se pudo escribir {path}: {exc}") from None
     return path
+
+
+def _remove_partial(path: Path) -> None:
+    """Borra el archivo que dejó un guardado fallido; si no se puede, no tapa el error original."""
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass

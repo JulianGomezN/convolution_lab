@@ -99,9 +99,9 @@ def default_out_dir(now: datetime | None = None, results_dir: Path | None = None
     return capture.unique_path(Path(results_dir or capture.RESULTS_DIR) / f"experimentos_{stamp}")
 
 
-def write_manifest(rows: list[dict], path: Path) -> Path:
+def write_manifest(rows: list[dict], path: Path, columns=MANIFEST_COLUMNS) -> Path:
     with Path(path).open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
     return Path(path)
@@ -113,8 +113,14 @@ def run_experiments(
     out_dir: Path,
     quick: bool = False,
     bench_sigmas=benchmark.SIGMAS,
+    extra_columns: dict | None = None,
 ) -> Path:
-    """Genera E1–E5 en `out_dir` y devuelve la ruta de manifest.csv."""
+    """Genera E1–E5 en `out_dir` y devuelve la ruta de manifest.csv.
+
+    Con `extra_columns` (p. ej. {"video": ruta, "frame": 0}, R11.5) el manifest
+    añade esas columnas tras MANIFEST_COLUMNS con el mismo valor en cada fila; los
+    PNG, sus nombres y E4_benchmark.csv no cambian (R11.2).
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     resources = []
@@ -151,7 +157,12 @@ def run_experiments(
                        perfil=kernels.PROFILE_NAMES[kernels.PROFILE_GAUSS],
                        metodo=f"{st.METHOD_2D} y {st.METHOD_SEPARABLE}")
             rows.append(row)
-        manifest = write_manifest(rows, out_dir / "manifest.csv")
+        columns = MANIFEST_COLUMNS
+        if extra_columns:
+            columns = MANIFEST_COLUMNS + tuple(extra_columns)
+            for row in rows:
+                row.update(extra_columns)
+        manifest = write_manifest(rows, out_dir / "manifest.csv", columns)
     finally:
         for obj in reversed(resources):
             obj.release()

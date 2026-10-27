@@ -35,10 +35,18 @@ KEY_RIGHT = "RIGHT"
 KEY_PAGE_UP = "PAGE_UP"
 KEY_PAGE_DOWN = "PAGE_DOWN"
 KEY_ESCAPE = "ESCAPE"
+# Reproducción de vídeo (V8): solo tienen efecto con --video.
+KEY_SPACE = "SPACE"
+KEY_PERIOD = "PERIOD"
+KEY_COMMA = "COMMA"
+KEY_HOME = "HOME"
+KEY_O = "O"
 # Teclas que también responden a la autorrepetición del teclado.
 REPEAT_KEYS = frozenset(
     {KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_PAGE_UP, KEY_PAGE_DOWN, KEY_LBRACKET, KEY_RBRACKET}
 )
+# Punto y coma también se repiten para recorrer frames manteniendo la tecla.
+PLAYBACK_REPEAT_KEYS = frozenset({KEY_PERIOD, KEY_COMMA})
 
 # --- acciones -----------------------------------------------------------
 ACTION_RELOAD = "reload"
@@ -46,6 +54,22 @@ ACTION_HELP = "help"
 ACTION_QUIT = "quit"
 ACTION_CAPTURE = "capture"
 ACTION_BENCHMARK = "benchmark"
+# Reproducción de vídeo: las ejecuta el Player; con imagen fija se ignoran (R6.11).
+ACTION_PLAY_PAUSE = "play_pause"
+ACTION_NEXT_FRAME = "next_frame"
+ACTION_PREV_FRAME = "prev_frame"
+ACTION_FIRST_FRAME = "first_frame"
+ACTION_TOGGLE_LOOP = "toggle_loop"
+PLAYBACK_ACTIONS = frozenset(
+    {ACTION_PLAY_PAUSE, ACTION_NEXT_FRAME, ACTION_PREV_FRAME, ACTION_FIRST_FRAME, ACTION_TOGGLE_LOOP}
+)
+_PLAYBACK_KEY_ACTIONS = {
+    KEY_SPACE: ACTION_PLAY_PAUSE,
+    KEY_PERIOD: ACTION_NEXT_FRAME,
+    KEY_COMMA: ACTION_PREV_FRAME,
+    KEY_HOME: ACTION_FIRST_FRAME,
+    KEY_O: ACTION_TOGGLE_LOOP,
+}
 
 # --- modos --------------------------------------------------------------
 MODE_KERNEL = "kernel"
@@ -108,6 +132,12 @@ Controles:
   R        recargar config/settings.json
   H        mostrar esta ayuda
   Esc      salir
+Vídeo (--video):
+  Espacio  pausa / reproducir
+  .        punto: frame siguiente (pausa)
+  ,        coma: frame anterior (pausa)
+  Inicio   volver al frame 0
+  O        bucle activado / desactivado
 Con el kernel personalizado activo, guardar settings.json lo recarga solo."""
 
 
@@ -246,6 +276,9 @@ def handle_key(state: AppState, key) -> tuple[AppState, str | None]:
         return state, ACTION_HELP
     if key == KEY_ESCAPE:
         return state, ACTION_QUIT
+    if key in _PLAYBACK_KEY_ACTIONS:
+        # Mismo estado, sin dirty: la reproducción la gestiona el Player (R6.11).
+        return state, _PLAYBACK_KEY_ACTIONS[key]
     return state, None
 
 

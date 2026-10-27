@@ -472,3 +472,41 @@ def test_core_modules_do_not_import_glfw(module):
     """Solo app.py importa glfw (D1)."""
     text = (ROOT / "src" / module).read_text(encoding="utf-8")
     assert "glfw" not in text
+
+
+# --- reproducción de vídeo (R6.11, R6.12) ------------------------------------
+
+_PLAYBACK_KEYS = [
+    (st.KEY_SPACE, st.ACTION_PLAY_PAUSE),
+    (st.KEY_PERIOD, st.ACTION_NEXT_FRAME),
+    (st.KEY_COMMA, st.ACTION_PREV_FRAME),
+    (st.KEY_HOME, st.ACTION_FIRST_FRAME),
+    (st.KEY_O, st.ACTION_TOGGLE_LOOP),
+]
+
+
+@pytest.mark.parametrize("key, action", _PLAYBACK_KEYS)
+@pytest.mark.parametrize("mode", [st.MODE_KERNEL, st.MODE_CANNY])
+def test_playback_keys_return_action_without_changing_state(key, action, mode):
+    """R6.11: mismo objeto de estado, sin marcar dirty; la acción la ejecuta el Player."""
+    for dirty in (False, True):
+        s0 = replace(AppState(mode=mode), dirty=dirty)
+        s1, got = handle_key(s0, key)
+        assert got == action
+        assert s1 is s0 and s1.dirty is dirty
+
+
+def test_playback_actions_set():
+    assert st.PLAYBACK_ACTIONS == {action for _, action in _PLAYBACK_KEYS}
+
+
+def test_playback_repeat_keys():
+    assert st.PLAYBACK_REPEAT_KEYS == {st.KEY_PERIOD, st.KEY_COMMA}
+    assert st.REPEAT_KEYS.isdisjoint(key for key, _ in _PLAYBACK_KEYS)
+
+
+def test_help_lists_playback_keys():
+    """R6.12: la ayuda documenta las teclas de vídeo."""
+    assert "Vídeo (--video)" in st.HELP_TEXT
+    for token in ("Espacio", "punto", "coma", "Inicio", "O "):
+        assert token in st.HELP_TEXT

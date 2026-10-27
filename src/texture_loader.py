@@ -14,6 +14,8 @@ from PIL import Image, UnidentifiedImageError
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ASSETS_DIR = PROJECT_ROOT / "assets" / "images"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif", ".webp"}
+# Extensiones que solo se abren con --video (R2.5); src/video.py las importa de aquí.
+VIDEO_ONLY_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov", ".webm")
 
 
 class ImageLoadError(Exception):
@@ -52,9 +54,12 @@ def load_image(path) -> np.ndarray:
     """Carga una imagen como ndarray uint8 H×W×4 (RGBA) con alfa = 255 (R4.1, R4.5).
 
     No aplica la orientación EXIF (supuesto S9). Lanza ImageLoadError si el archivo
-    no existe, no es legible o no es una imagen válida (R4.3).
+    no existe, no es legible o no es una imagen válida (R4.3), o si la extensión es
+    de vídeo (R2.5). Un GIF/APNG/WebP animado carga su frame 0 (R2.4).
     """
     path = Path(path)
+    if path.suffix.lower() in VIDEO_ONLY_SUFFIXES:
+        raise ImageLoadError(path, "es un archivo de vídeo; ábrelo con --video RUTA")
     if not path.exists():
         raise ImageLoadError(path, "el archivo no existe")
     if not path.is_file():

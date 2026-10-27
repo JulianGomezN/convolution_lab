@@ -9,6 +9,7 @@ También crea el contexto sin ventana visible de --benchmark y --experiments.
 from __future__ import annotations
 
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime
@@ -20,6 +21,9 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from src import benchmark, capture, experiments, kernels, state as st
+from src import playback, video
+from src import video as _video  # alias: en _headless el parámetro `video` tapa el módulo
+from src.playback import EffectiveFps, PlaybackClock, Player, Timeline
 from src.config import SETTINGS_PATH, ConfigError, SettingsWatcher, load_settings
 from src.framebuffers import RenderTarget
 from src.pipeline import Processor
@@ -78,7 +82,17 @@ KEY_MAP = {
     glfw.KEY_PAGE_UP: st.KEY_PAGE_UP,
     glfw.KEY_PAGE_DOWN: st.KEY_PAGE_DOWN,
     glfw.KEY_ESCAPE: st.KEY_ESCAPE,
+    # Reproducción de vídeo (V8): posición física US; punto y coma coinciden en ES.
+    glfw.KEY_SPACE: st.KEY_SPACE,
+    glfw.KEY_PERIOD: st.KEY_PERIOD,
+    glfw.KEY_COMMA: st.KEY_COMMA,
+    glfw.KEY_HOME: st.KEY_HOME,
+    glfw.KEY_O: st.KEY_O,
 }
+# Teclas que responden a la autorrepetición: flechas, RePág/AvPág, punto y coma.
+_REPEATABLE = st.REPEAT_KEYS | st.PLAYBACK_REPEAT_KEYS
+# Tope de la espera mientras se reproduce: el FPS_Efectivo se refresca ≥ 1 vez/s (R8.3).
+PLAYBACK_MAX_WAIT_S = 1.0
 
 # En un teclado español la tecla física de [ y ] no siempre coincide con GLFW_KEY_
 # LEFT/RIGHT_BRACKET; el teclado numérico - y + sirve de alias para el radio de la
@@ -159,7 +173,20 @@ def _warn(msg: str) -> None:
 
 
 class App:
-    def __init__(self, image, image_path: Path, settings_path: Path = SETTINGS_PATH):
+    def __init__(
+        self,
+        image,
+        image_path: Path,
+        settings_path: Path = SETTINGS_PATH,
+        source=None,
+        now=time.perf_counter,
+    ):
+        # Con `source` (vídeo o animación), `image` es su frame 0.
+        self.source = source
+        self.player = None  # Player; se crea con el contexto si hay source
+        self.now = now  # reloj de pared inyectable (tests)
+        self._last_result = None  # (tex, view) del último Processor.run, para present()
+        self._panel_dirty = False  # redibujar solo panel y título, sin Processor
         self.image = image
         self.image_path = Path(image_path)
         self.height, self.width = image.shape[:2]
@@ -242,14 +269,24 @@ class App:
 
     def _check_sizes(self, max_texture_size: int) -> None:
         w, h = self.size
-        check_texture_limit(self.image_path, self.size, max_texture_size)
+        if self.source is not None:
+            kind = "el vídeo"
+            check_texture_limit(
+                self.image_path, self.size, max_texture_size, error_cls=video.VideoOpenError, kind=kind
+            )  # R3.5
+        else:
+            kind = "la imagen"
+            check_texture_limit(self.image_path, self.size, max_texture_size)
         monitor = glfw.get_primary_monitor()
         if monitor:
+            # Se compara la ventana completa (panel + imagen) con el área de trabajo (R4.7).
             _, _, mw, mh = glfw.get_monitor_workarea(monitor)
-            if w > mw or h > mh:
+            ww, wh = self.window_size
+            if ww > mw or wh > mh:
                 _warn(
-                    f"la imagen ({w}x{h}) es mayor que el área de trabajo del monitor ({mw}x{mh}); "
-                    "no se reescala, parte de la ventana puede quedar fuera de la pantalla."
+                    f"la ventana ({ww}x{wh}) para {kind} ({w}x{h}) es mayor que el área de trabajo "
+                    f"del monitor ({mw}x{mh}); no se reescala, parte de la ventana puede quedar "
+                    "fuera de la pantalla."
                 )
         fw, fh = glfw.get_framebuffer_size(self.window)
         print(f"imagen {w}x{h} | ventana {fw}x{fh}")
@@ -266,6 +303,7 @@ class App:
         self.prog_display = self._keep(load_program(ctx, "display.frag"))
         self.prog_status = self._keep(load_program(ctx, "status.frag"))
         self.input_tex = self._keep(create_texture(ctx, self.image))
+        self.player = self._create_player() if self.source is not None else None
         self.processor = self._keep(Processor(ctx, self.quad, self.input_tex))
         self.screen = RenderTarget.screen(ctx, self.window_size)
         self.status_tex = self._keep(ctx.texture(self.window_size, 4, dtype="f1"))
@@ -273,6 +311,18 @@ class App:
         self.timer = benchmark.GpuTimer(ctx)
         self._init_fonts()
         self._update_status_texture()
+
+    def _create_player(self) -> Player:
+        """Reloj, medidor de FPS y Player sobre input_tex (que ya tiene el frame 0)."""
+        source = self.source
+        if source.durations is not None:
+            timeline = Timeline.from_durations(source.durations)
+        else:
+            timeline = Timeline.constant(source.fps, source.n_frames)
+        now = self.now()
+        clock = PlaybackClock(timeline, now)
+        # Los avisos del Player ya empiezan por "Aviso:": se imprimen tal cual.
+        return Player(source, self.input_tex, clock, EffectiveFps(now), video.print_warning)
 
     def _init_fonts(self) -> None:
         """Fuentes del panel (R16.3). Se cargan una vez; load_default si truetype falla."""
@@ -292,7 +342,7 @@ class App:
         if mapped is None:
             return  # tecla sin asignar (R16.5)
         # Flechas y RePág/AvPág también responden a la autorrepetición.
-        if action == glfw.PRESS or (action == glfw.REPEAT and mapped in st.REPEAT_KEYS):
+        if action == glfw.PRESS or (action == glfw.REPEAT and mapped in _REPEATABLE):
             self.apply_key(mapped)
 
     def _on_cursor_pos(self, window, x, y):
@@ -327,11 +377,18 @@ class App:
             self.capture()
         elif action == st.ACTION_BENCHMARK:
             self.benchmark()
+        elif action in st.PLAYBACK_ACTIONS and self.player is not None:
+            # El reloj cambia ya; el frame nuevo lo sube player.update() en el bucle.
+            self.player.handle(action, self.now())
+            self._panel_dirty = True
 
     def capture(self) -> Path | None:
         """Guarda el resultado visible como PNG W×H en results/ (R15). Si falla, avisa y sigue."""
         tex, view = self.processor.run(self.state)
-        path = capture.unique_path(self.results_dir / capture.capture_name(self.state, datetime.now()))
+        # Con vídeo, el índice del frame visible va en el nombre; el reloj no se toca (R10.2, R10.4).
+        frame_index = self.player.shown_index if self.player is not None else None
+        name = capture.capture_name(self.state, datetime.now(), frame_index=frame_index)
+        path = capture.unique_path(self.results_dir / name)
         try:
             rgb = capture.render_display(
                 self.ctx, self.quad, self.prog_display, tex, view, getattr(self, "input_tex", None)
@@ -402,7 +459,27 @@ class App:
     # --- render ---------------------------------------------------------
 
     def _title(self) -> str:
-        return st.title(self.state, self.image_path.name, self.size, self.last_gpu_ms)
+        title = st.title(self.state, self.image_path.name, self.size, self.last_gpu_ms)
+        if self.player is not None:
+            # Con vídeo: frame y estado del reproductor tras el tiempo de GPU (R8.5).
+            title += " | " + playback.title_suffix(self.player, self.now())
+        return title
+
+    def _video_rows(self) -> list[str]:
+        """Filas pequeñas de la sección VÍDEO del panel (R8.1–R8.4, R8.8)."""
+        player = self.player
+        clock = player.clock
+        k = player.shown_index
+        size = f"{self.size[0]} x {self.size[1]}"
+        frame = playback.frame_label(k, clock.timeline.n_frames)
+        moment = playback.time_label(clock.timeline.start(k))
+        status = f"{playback.status_label(clock.playing)} · {playback.loop_label(clock.loop)}"
+        effective = None if not clock.playing else player.fps.value(self.now())
+        fps = (
+            f"fps {playback.fps_label(player.source.fps)} nominal · "
+            f"{playback.fps_label(effective)} efectivo"
+        )
+        return [f"{size} · {frame} · {moment}", status, fps]
 
     def _mode_summary(self) -> str:
         """Dato principal del modo activo, para la sección MODO del panel (R16.3)."""
@@ -442,11 +519,17 @@ class App:
         ]
 
     def _update_status_texture(self) -> None:
-        """Dibuja el panel lateral izquierdo y el marco de la imagen (R16.3).
+        """Dibuja el panel (_draw_panel) y lo sube a status_tex."""
+        image, self._panel_content_height = self._draw_panel()
+        self.status_tex.write(np.asarray(image, dtype=np.uint8).tobytes())
 
-        El panel es una textura RGBA sólida en x ∈ [0, PANEL_WIDTH); el resto queda
+    def _draw_panel(self) -> tuple[Image.Image, int]:
+        """Dibuja el panel lateral izquierdo y el marco de la imagen (R16.3, R8).
+
+        El panel es una imagen RGBA sólida en x ∈ [0, PANEL_WIDTH); el resto queda
         transparente para que status.frag solo tape el área del panel. El marco del
-        color del borde activo rodea la imagen sin invadir su interior.
+        color del borde activo rodea la imagen sin invadir su interior. Devuelve la
+        imagen y el alto ocupado por el contenido; no usa la GPU.
         """
         width, height = self.window_size
         image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -481,11 +564,20 @@ class App:
         draw.text((margin, y), "CONVOLUCIÓN", font=self.font_title, fill=PANEL_TITLE)
         y += 30
 
-        # IMAGEN.
-        header("Imagen")
-        value(self.image_path.name)
-        value(f"{self.size[0]} x {self.size[1]}", fill=PANEL_DIM, font=self.font_small)
-        gap()
+        if self.player is not None:
+            # VÍDEO (sustituye a IMAGEN, R8.1–R8.4).
+            header("Vídeo")
+            value(self.image_path.name)
+            for line in self._video_rows():
+                draw.text((margin, y), line, font=self.font_small, fill=PANEL_DIM)
+                y += 18
+            gap()
+        else:
+            # IMAGEN.
+            header("Imagen")
+            value(self.image_path.name)
+            value(f"{self.size[0]} x {self.size[1]}", fill=PANEL_DIM, font=self.font_small)
+            gap()
 
         # MODO.
         header("Modo")
@@ -528,7 +620,7 @@ class App:
         controls = [
             "1-8 kernel   B borde   M modo",
             "C canny   L lupa   G captura",
-            "H ayuda completa",
+            "Esp pausa  . , frame  O bucle  H ayuda" if self.player is not None else "H ayuda completa",
         ]
         for line in controls:
             draw.text((margin, y), line, font=self.font_small, fill=PANEL_DIM)
@@ -536,7 +628,7 @@ class App:
 
         # Alto realmente ocupado por el contenido del panel; sirve para verificar
         # (en los tests) que PANEL_MIN_HEIGHT lo cubre con holgura inferior.
-        self._panel_content_height = y
+        content_height = y
 
         # Marco fino del color del borde alrededor del área de imagen (sin taparla).
         vx, vy, vw, vh = image_viewport(self.window_size, self.size)
@@ -546,8 +638,7 @@ class App:
             outline=accent,
             width=frame_w,
         )
-
-        self.status_tex.write(np.asarray(image, dtype=np.uint8).tobytes())
+        return image, content_height
 
     def render(self) -> bool:
         fw, fh = glfw.get_framebuffer_size(self.window)
@@ -555,6 +646,27 @@ class App:
             return False
         # Tiempo de GPU de las pasadas de procesado, sin la de pantalla (R14.5).
         (tex, view), self.last_gpu_ms = self.timer.measure(lambda: self.processor.run(self.state))
+        self._last_result = (tex, view)
+        self._draw_frame((fw, fh), tex, view)
+        return True
+
+    def present(self) -> bool:
+        """Redibuja pantalla y panel con el último resultado, sin Processor.run (R5.9, R8.3).
+
+        Sirve para refrescar estado de pausa, bucle o FPS_Efectivo sin volver a
+        procesar. Si aún no hay resultado, hace un render() completo.
+        """
+        if self._last_result is None:
+            return self.render()
+        fw, fh = glfw.get_framebuffer_size(self.window)
+        if fw == 0 or fh == 0:  # ventana minimizada: no se dibuja
+            return False
+        self._draw_frame((fw, fh), *self._last_result)
+        return True
+
+    def _draw_frame(self, fb_size: tuple[int, int], tex, view) -> None:
+        """display.frag con (tex, view) + panel + swap + título."""
+        fw, fh = fb_size
         # La imagen conserva su tamaño y va pegada a la derecha del panel; el resto
         # es un fondo gris muy oscuro.
         viewport = image_viewport((fw, fh), self.size)
@@ -578,19 +690,58 @@ class App:
         self.ctx.disable(moderngl.BLEND)
         glfw.swap_buffers(self.window)
         glfw.set_window_title(self.window, self._title())
-        return True
+
+    def _wait_timeout(self) -> float:
+        """Espera de la iteración (R7.9, R8.3, R9.1).
+
+        Reproduciendo: hasta el próximo cambio de frame, con tope de 1 s. En pausa,
+        con imagen fija o sin próximo cambio conocido: WAIT_TIMEOUT_S, que mantiene
+        la vigilancia de settings.json por debajo de 1 s (R7.3).
+        """
+        player = self.player
+        if player is not None and player.clock.playing:
+            now = self.now()
+            next_change = player.clock.next_change_time(now)
+            if next_change is not None:
+                return min(max(0.0, next_change - now), PLAYBACK_MAX_WAIT_S)
+        return WAIT_TIMEOUT_S
+
+    def _wait(self, timeout: float) -> None:
+        """Procesa eventos: sin esperar si timeout ≤ 0; si no, espera como máximo timeout."""
+        if timeout <= 0:
+            glfw.poll_events()
+        else:
+            glfw.wait_events_timeout(timeout)
+
+    def loop_once(self) -> None:
+        """Una iteración del bucle principal (diagrama "Bucle principal" del diseño)."""
+        # Render bajo demanda (S12): espera eventos sin gastar CPU ni GPU.
+        self._wait(self._wait_timeout())
+        self.poll_settings()
+        changes = self.player.update(self.now()) if self.player is not None else None
+        if (changes is not None and changes.frame) or self.state.dirty:
+            if self.render():
+                self.state = replace(self.state, dirty=False)
+                self._panel_dirty = False
+            elif changes is not None and changes.frame:
+                # Minimizada: el frame nuevo ya está en la textura; se dibuja al volver.
+                self.state = replace(self.state, dirty=True)
+        elif (changes is not None and changes.status) or self._panel_dirty:
+            if self.present():
+                self._panel_dirty = False
 
     def loop(self) -> None:
         while not glfw.window_should_close(self.window):
-            # Render bajo demanda (S12): espera eventos sin gastar CPU ni GPU.
-            glfw.wait_events_timeout(WAIT_TIMEOUT_S)
-            self.poll_settings()
-            if self.state.dirty and self.render():
-                self.state = replace(self.state, dirty=False)
+            self.loop_once()
 
     # --- liberación -----------------------------------------------------
 
     def release(self) -> None:
+        # Primero la fuente (termina ffmpeg / libera el archivo), después GL (R12.1).
+        # safe_close avisa si close() lanza y no relanza (R12.7). Sus mensajes ya
+        # empiezan por "Aviso:", así que se imprimen tal cual.
+        video.safe_close(self.source, video.print_warning)
+        self.source = None
         for obj in reversed(self._resources):
             try:
                 obj.release()
@@ -614,13 +765,19 @@ def print_gl_info(ctx: moderngl.Context) -> None:
     print(f"GL_VENDOR:   {info['GL_VENDOR']}")
 
 
-def check_texture_limit(image_path, size: tuple[int, int], max_texture_size: int) -> None:
-    """Código 2 si la imagen supera GL_MAX_TEXTURE_SIZE (R3.3)."""
+def check_texture_limit(
+    image_path,
+    size: tuple[int, int],
+    max_texture_size: int,
+    error_cls: type[ImageLoadError] = ImageLoadError,
+    kind: str = "la imagen",
+) -> None:
+    """Código 2 si la imagen o el vídeo supera GL_MAX_TEXTURE_SIZE (R3.3; vídeo: R3.5)."""
     w, h = size
     if w > max_texture_size or h > max_texture_size:
-        raise ImageLoadError(
+        raise error_cls(
             image_path,
-            f"la imagen mide {w}x{h} y supera GL_MAX_TEXTURE_SIZE ({max_texture_size}) de esta GPU",
+            f"{kind} mide {w}x{h} y supera GL_MAX_TEXTURE_SIZE ({max_texture_size}) de esta GPU",
         )
 
 
@@ -633,6 +790,29 @@ def run(image_path) -> int:
         app.loop()
     finally:
         app.release()
+    return 0
+
+
+def run_video(path) -> int:
+    """Abre el vídeo y decodifica el frame 0 antes de crear la ventana; después el bucle.
+
+    Los errores de apertura (R3.1–R3.4) salen como VideoOpenError (código 2) sin
+    crear ventana. El `finally` externo cierra la fuente aunque fallen App(...) o
+    init(), también con Ctrl+C (R12.2); repetir el cierre no hace nada (R12.6).
+    """
+    path = Path(path)
+    source = video.open_source(path)
+    try:
+        frame0 = source.read(0)
+        print(video.describe(source))  # R4.6, una vez antes del primer frame
+        app = App(frame0, path, source=source)
+        try:
+            app.init()
+            app.loop()
+        finally:
+            app.release()
+    finally:
+        video.safe_close(source)
     return 0
 
 
@@ -692,37 +872,60 @@ def offscreen_context():
             glfw.terminate()
 
 
-def _headless(image_path, task) -> int:
-    """Carga la imagen (código 2 si falla), crea el contexto sin ventana y ejecuta `task(ctx, image)`."""
-    image = load_image(image_path)
+def _headless(image_path, task, video: bool = False) -> int:
+    """Carga la entrada, crea el contexto sin ventana y ejecuta `task(ctx, image, extra)`.
+
+    Modo imagen: `load_image` (código 2 si falla) y `extra = None`. Con `video=True`
+    se abre el vídeo, se decodifica el frame 0 y la fuente se cierra antes de crear
+    el contexto (R11.3, R12.3); `extra = {"video": ruta, "frame": 0}` (R11.4, R11.5).
+    Todos los errores de apertura ocurren antes de `task`: no se crea ningún CSV ni
+    carpeta de resultados (R11.6).
+    """
+    path = Path(image_path)
+    if video:
+        with _video.open_source(path) as source:
+            image = source.read(0)
+        extra = {"video": str(path), "frame": 0}
+    else:
+        image = load_image(path)
+        extra = None
     h, w = image.shape[:2]
     with offscreen_context() as ctx:
         print_gl_info(ctx)
-        check_texture_limit(image_path, (w, h), ctx.info["GL_MAX_TEXTURE_SIZE"])
-        print(f"imagen {Path(image_path).name} {w}x{h}")
-        task(ctx, image)
+        max_size = ctx.info["GL_MAX_TEXTURE_SIZE"]
+        if video:
+            check_texture_limit(path, (w, h), max_size, error_cls=_video.VideoOpenError, kind="el vídeo")  # R3.5
+            print(f"vídeo: {path} | frame 0")
+        else:
+            check_texture_limit(path, (w, h), max_size)
+        print(f"imagen {path.name} {w}x{h}")
+        task(ctx, image, extra)
     return 0
 
 
-def run_benchmark(image_path, quick: bool = False) -> int:
-    """--benchmark: tabla en consola y results/benchmark_<fecha>.csv; código 0 (R14.7)."""
+def run_benchmark(image_path, quick: bool = False, video: bool = False) -> int:
+    """--benchmark: tabla en consola y results/benchmark_<fecha>.csv; código 0 (R14.7, R11.1)."""
 
-    def task(ctx, image):
+    def task(ctx, image, extra):
         quad = Quad(ctx)
         tex = create_texture(ctx, image)
         proc = Processor(ctx, quad, tex)
         try:
-            benchmark.benchmark_and_save(ctx, proc, border=st.AppState().border, quick=quick)
+            benchmark.benchmark_and_save(
+                ctx, proc, border=st.AppState().border, quick=quick, extra_columns=extra
+            )
         finally:
             proc.release()
             tex.release()
             quad.release()
 
-    return _headless(image_path, task)
+    return _headless(image_path, task, video=video)
 
 
-def run_experiments(image_path, quick: bool = False) -> int:
-    """--experiments: E1–E5 y manifest.csv en results/experimentos_<fecha>/ (R17.1)."""
-    return _headless(
-        image_path, lambda ctx, image: experiments.run_experiments(ctx, image, experiments.default_out_dir(), quick)
-    )
+def run_experiments(image_path, quick: bool = False, video: bool = False) -> int:
+    """--experiments: E1–E5 y manifest.csv en results/experimentos_<fecha>/ (R17.1, R11.2)."""
+
+    def task(ctx, image, extra):
+        experiments.run_experiments(ctx, image, experiments.default_out_dir(), quick, extra_columns=extra)
+
+    return _headless(image_path, task, video=video)

@@ -28,6 +28,7 @@ CSV_COLUMNS = (
     "fecha", "gpu", "W", "H", "borde", "sigma", "r", "metodo", "lecturas_px",
     "media_ms", "mediana_ms", "desv_ms", "min_ms", "aceleracion",
 )
+VIDEO_COLUMNS = ("video", "frame")  # columnas extra con --video (R11.1)
 
 
 def _warn(msg: str) -> None:
@@ -150,15 +151,16 @@ def default_csv_path(now: datetime | None = None, results_dir: Path | None = Non
     return unique_path(Path(results_dir or RESULTS_DIR) / f"benchmark_{stamp}.csv")
 
 
-def write_csv(rows: list[dict], path: Path) -> Path:
-    """Escribe las filas con las columnas de CSV_COLUMNS; crea la carpeta si falta."""
+def write_csv(rows: list[dict], path: Path, columns=CSV_COLUMNS) -> Path:
+    """Escribe las filas con las columnas indicadas (CSV_COLUMNS por defecto); crea la carpeta si falta."""
     path = Path(path)
+    columns = tuple(columns)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(CSV_COLUMNS)
+        writer.writerow(columns)
         for row in rows:
-            writer.writerow([_fmt(row[c]) for c in CSV_COLUMNS])
+            writer.writerow([_fmt(row[c]) for c in columns])
     return path
 
 
@@ -189,8 +191,13 @@ def benchmark_and_save(
     quick: bool = False,
     csv_path: Path | None = None,
     sigmas=SIGMAS,
+    extra_columns: dict | None = None,
 ) -> Path | None:
-    """Ejecuta el benchmark, imprime la tabla y guarda el CSV. Devuelve la ruta o None sin tiempos."""
+    """Ejecuta el benchmark, imprime la tabla y guarda el CSV. Devuelve la ruta o None sin tiempos.
+
+    Con `extra_columns` (p. ej. {"video": ruta, "frame": 0}), cada fila lleva esos
+    valores y el CSV usa CSV_COLUMNS + sus claves (R11.1); sin él, el CSV no cambia.
+    """
     warmup, repeats = (QUICK_WARMUP, QUICK_REPEATS) if quick else (WARMUP, REPEATS)
     # Solo caracteres de cp1252 en consola: con la salida redirigida a un archivo,
     # Windows usa esa codificación y «σ» lanzaría UnicodeEncodeError.
@@ -201,6 +208,11 @@ def benchmark_and_save(
         _warn("benchmark sin tiempos: no se guarda el CSV.")
         return None
     print(format_table(rows))
-    path = write_csv(rows, csv_path or default_csv_path())
+    columns = CSV_COLUMNS
+    if extra_columns:
+        columns = CSV_COLUMNS + tuple(extra_columns)
+        for row in rows:
+            row.update(extra_columns)
+    path = write_csv(rows, csv_path or default_csv_path(), columns)
     print(f"CSV del benchmark: {path}")
     return path

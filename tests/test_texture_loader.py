@@ -121,3 +121,30 @@ def test_generator_is_deterministic(tmp_path):
 def test_default_assets_exist():
     for name in ("orientacion.png", "escalon.png", "tablero.png", "circulo.png", "ruido.png"):
         assert name in available_images(), f"falta assets/images/{name}: ejecuta tools/make_test_images.py"
+
+
+@pytest.mark.parametrize("name", ["clip.mp4", "clip.MP4", "a.avi", "a.mkv", "a.Mov", "a.webm"])
+def test_video_suffix_rejected_before_existence_check(tmp_path, name):
+    # R2.5: el archivo no existe, pero el motivo es la extensión de vídeo.
+    with pytest.raises(ImageLoadError) as info:
+        load_image(tmp_path / name)
+    assert "--video" in str(info.value)
+    assert "vídeo" in info.value.reason
+    assert "no existe" not in info.value.reason
+
+
+def test_animated_gif_loads_frame_zero(tmp_path):
+    # R2.4: un GIF animado por --image sigue cargando solo el frame 0.
+    w, h = 6, 4
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    frames = [Image.new("RGB", (w, h), c) for c in colors]
+    path = tmp_path / "anim.gif"
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    with Image.open(path) as check:
+        assert check.n_frames == 3
+
+    arr = load_image(path)
+    assert arr.shape == (h, w, 4)
+    assert arr.dtype == np.uint8
+    assert np.all(arr[..., 3] == 255)
+    assert np.all(arr[..., :3] == np.array(colors[0], np.uint8))

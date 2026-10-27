@@ -102,3 +102,62 @@ def test_experiments_cli_subprocess(ctx, tmp_path):
     finally:
         for d in created:
             shutil.rmtree(d)
+
+
+# --- Vídeo (R11.2, R11.3, R11.5, R13.11) ----------------------------------------
+
+
+def _make_gif(path: Path, size=(14, 10), n=3) -> Path:
+    """Animación pequeña con frames distintos (W×H = size)."""
+    rng = np.random.default_rng(53)
+    frames = [Image.fromarray(rng.integers(0, 256, size=(size[1], size[0], 3), dtype=np.uint8)) for _ in range(n)]
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    return path
+
+
+def test_run_experiments_extra_columns(ctx, tmp_path):
+    """Con extra_columns: mismas capturas y columnas + video, frame; sin él, MANIFEST_COLUMNS exactas."""
+    img = np.random.default_rng(54).integers(0, 256, size=(10, 14, 4), dtype=np.uint8)
+    img[..., 3] = 255
+    extra = {"video": str(tmp_path / "anim.gif"), "frame": 0}
+    with_v = experiments.run_experiments(ctx, img, tmp_path / "v", quick=True, bench_sigmas=(1.0,),
+                                         extra_columns=extra)
+    plain = experiments.run_experiments(ctx, img, tmp_path / "i", quick=True, bench_sigmas=(1.0,))
+    with with_v.open(encoding="utf-8") as f:
+        rows_v = list(csv.DictReader(f))
+    with plain.open(encoding="utf-8") as f:
+        rows_i = list(csv.DictReader(f))
+    assert tuple(rows_v[0]) == experiments.MANIFEST_COLUMNS + ("video", "frame")
+    assert tuple(rows_i[0]) == experiments.MANIFEST_COLUMNS
+    assert all(r["video"] == extra["video"] and r["frame"] == "0" for r in rows_v)
+    assert [r["archivo"] for r in rows_v] == [r["archivo"] for r in rows_i]
+    assert sorted(p.name for p in (tmp_path / "v").iterdir()) == sorted(p.name for p in (tmp_path / "i").iterdir())
+
+
+def test_video_experiments_cli_subprocess(ctx, tmp_path):
+    """--video <gif> --experiments --quick: código 0, ruta y frame 0 en consola y en el manifest (R11.2, R11.5)."""
+    gif = _make_gif(tmp_path / "anim.gif")
+    results = ROOT / "results"
+    before = set(results.glob("experimentos_*"))
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "main.py"), "--video", str(gif), "--experiments", "--quick"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT, timeout=600,
+    )
+    created = set(results.glob("experimentos_*")) - before
+    try:
+        assert proc.returncode == 0, proc.stderr
+        assert str(gif) in proc.stdout and "| frame 0" in proc.stdout
+        assert len(created) == 1
+        out = next(iter(created))
+        pngs = list(out.glob("*.png"))
+        assert len(pngs) == sum(EXPECTED_PNG.values())
+        with Image.open(pngs[0]) as im:
+            assert im.size == (14, 10)
+        with (out / "manifest.csv").open(encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert tuple(rows[0]) == experiments.MANIFEST_COLUMNS + ("video", "frame")
+        assert len(rows) == len(pngs) + 1
+        assert all(r["video"] == str(gif) and r["frame"] == "0" for r in rows)
+    finally:
+        for d in created:
+            shutil.rmtree(d)

@@ -298,3 +298,284 @@ def test_on_key_repeat_only_for_arrows_and_page_keys(make_app):
     assert a.state.profile == kernels.PROFILE_BOX
     a._on_key(None, glfw.KEY_UP, 0, glfw.RELEASE, 0)
     assert a.state.sigma == sigma + 0.5
+
+
+# --- App con vídeo y GLFW falso (soporte-video: R5.9, R6.11, R7.9, R7.10, R8.5, R8.6, R10.4, R10.5, R12.1, R12.7)
+
+
+from src import state as st  # noqa: E402
+
+
+class FakeSource:
+    """Fuente de frames mínima: frames constantes del tamaño declarado."""
+
+    def __init__(self, path, size=(7, 5), fps=10.0, n_frames=10, durations=None, log=None, close_error=None):
+        self.path = path
+        self.size = size
+        self.fps = fps
+        self.n_frames = n_frames
+        self.durations = durations
+        self.log = log if log is not None else []
+        self.close_error = close_error
+        self.reads = []
+
+    def read(self, index):
+        self.reads.append(index)
+        w, h = self.size
+        return np.full((h, w, 4), index % 256, np.uint8)
+
+    def close(self):
+        self.log.append("source.close")
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class FakeTexture:
+    def __init__(self):
+        self.writes = 0
+
+    def write(self, data):
+        self.writes += 1
+
+
+class Spy:
+    """Objeto GL falso que anota su liberación en un registro compartido."""
+
+    def __init__(self, name, log):
+        self.name, self.log = name, log
+
+    def release(self):
+        self.log.append(self.name)
+
+
+class FakeClock:
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+@pytest.fixture
+def glfw_fake(monkeypatch):
+    calls = {"titles": [], "poll": 0, "wait": [], "fb": (400, 640)}
+    g = app_mod.glfw
+    monkeypatch.setattr(g, "set_window_title", lambda w, t: calls["titles"].append(t))
+    monkeypatch.setattr(g, "set_window_should_close", lambda w, v: None)
+    monkeypatch.setattr(g, "poll_events", lambda: calls.__setitem__("poll", calls["poll"] + 1))
+    monkeypatch.setattr(g, "wait_events_timeout", lambda t: calls["wait"].append(t))
+    monkeypatch.setattr(g, "get_framebuffer_size", lambda w: calls["fb"])
+    return calls
+
+
+@pytest.fixture
+def make_video_app(tmp_path, glfw_fake):
+    settings = _write(tmp_path / "settings.json", {"custom_kernel": list(SHARPEN)})
+
+    def make(clock=None, **source_kw):
+        clock = clock or FakeClock()
+        src = FakeSource(tmp_path / "clip.mp4", **source_kw)
+        w, h = src.size
+        a = app_mod.App(np.zeros((h, w, 4), np.uint8), src.path, settings_path=settings, source=src, now=clock)
+        a.input_tex = FakeTexture()
+        a.player = a._create_player()
+        a.clock = clock
+        return a
+
+    return make
+
+
+def test_playback_keys_ignored_with_still_image(make_app, glfw_fake):
+    a, _ = make_app(list(SHARPEN))
+    assert a.player is None
+    before = a.state
+    n = len(glfw_fake["titles"])
+    for key in (st.KEY_SPACE, st.KEY_PERIOD, st.KEY_COMMA, st.KEY_HOME, st.KEY_O):
+        a.apply_key(key)
+    assert a.state is before  # ni estado ni dirty cambian (R6.11)
+    assert a._panel_dirty is False
+    assert len(glfw_fake["titles"]) == n
+
+
+def test_apply_key_forwards_playback_actions_to_player(make_video_app):
+    a = make_video_app(clock=FakeClock(3.5))
+
+    class RecordingPlayer:
+        def __init__(self):
+            self.calls = []
+
+        def handle(self, action, now):
+            self.calls.append((action, now))
+
+    a.player = RecordingPlayer()
+    before = a.state
+    a.apply_key(st.KEY_SPACE)
+    a.apply_key(st.KEY_PERIOD)
+    a.apply_key(st.KEY_O)
+    assert a.player.calls == [
+        (st.ACTION_PLAY_PAUSE, 3.5),
+        (st.ACTION_NEXT_FRAME, 3.5),
+        (st.ACTION_TOGGLE_LOOP, 3.5),
+    ]
+    assert a._panel_dirty is True
+    assert a.state is before  # el AppState no se toca: no hay Processor.run
+
+
+def test_loop_timeout_while_playing_is_next_change_minus_now(make_video_app, glfw_fake):
+    a = make_video_app(fps=10.0)  # el reloj se ancla en t = 0
+    a.clock.t = 0.03  # siguiente cambio en t = 0.1
+    a.render = lambda: True
+    assert a._wait_timeout() == pytest.approx(0.07)
+    a.loop_once()
+    assert glfw_fake["poll"] == 0
+    assert glfw_fake["wait"] == [pytest.approx(0.07)]
+
+
+def test_loop_timeout_capped_at_one_second(make_video_app):
+    a = make_video_app(fps=0.25, n_frames=3)  # 4 s por frame
+    assert a._wait_timeout() == app_mod.PLAYBACK_MAX_WAIT_S == 1.0
+
+
+def test_loop_timeout_paused_and_still_image(make_video_app, make_app):
+    a = make_video_app(clock=FakeClock(0.03))
+    a.player.clock.toggle_play(0.03)
+    assert not a.player.clock.playing
+    assert a._wait_timeout() == app_mod.WAIT_TIMEOUT_S == 0.25
+    still, _ = make_app(list(SHARPEN))
+    assert still._wait_timeout() == 0.25
+
+
+def test_loop_overdue_polls_instead_of_waiting(make_video_app, glfw_fake):
+    clock = FakeClock(0.0)
+    a = make_video_app(clock=clock, fps=10.0, n_frames=10)
+    a.player.clock.toggle_loop(0.0)  # sin bucle: en t ≥ D toca pausar ya
+    rendered = []
+    a.render = lambda: rendered.append(True) or True
+    clock.t = 1.5
+    assert a._wait_timeout() == 0.0
+    a.loop_once()
+    assert glfw_fake["poll"] == 1
+    assert glfw_fake["wait"] == []
+    assert a.player.shown_index == 9 and not a.player.clock.playing
+    assert rendered == [True]
+
+
+def test_present_redraws_without_processor_run(make_video_app):
+    a = make_video_app()
+
+    class NoRun:
+        def run(self, state):
+            raise AssertionError("present() no debe llamar a Processor.run")
+
+    a.processor = NoRun()
+    drawn = []
+    a._draw_frame = lambda fb, tex, view: drawn.append((fb, tex, view))
+    a._last_result = ("tex", "view")
+    assert a.present() is True
+    assert drawn == [((400, 640), "tex", "view")]
+    # loop_once con solo el panel sucio también usa present().
+    a.state = replace(a.state, dirty=False)
+    a._panel_dirty = True
+    a.player.clock.toggle_play(a.now())  # en pausa: update() no cambia el frame
+    a.loop_once()
+    assert len(drawn) == 2 and a._panel_dirty is False
+
+
+def test_title_with_and_without_video(make_video_app, make_app):
+    a = make_video_app(n_frames=10)
+    title = a._title()
+    assert title.endswith(" | frame 0/10 | reproduciendo")
+    a.player.clock.toggle_play(0.0)
+    assert a._title().endswith(" | frame 0/10 | pausa")
+    still, _ = make_app(list(SHARPEN))
+    plain = still._title()
+    assert "frame" not in plain and "reproduciendo" not in plain and "pausa" not in plain
+
+
+def _panel_texts(a, monkeypatch):
+    texts = []
+    real_draw = app_mod.ImageDraw.Draw
+
+    def draw(image):
+        d = real_draw(image)
+        real_text = d.text
+
+        def text(xy, s, *args, **kw):
+            texts.append(s)
+            return real_text(xy, s, *args, **kw)
+
+        d.text = text
+        return d
+
+    monkeypatch.setattr(app_mod.ImageDraw, "Draw", draw)
+    a._init_fonts()
+    a._draw_panel()
+    return texts
+
+
+def test_panel_without_video_section_for_still_image(make_app, monkeypatch):
+    a, _ = make_app(list(SHARPEN))
+    texts = _panel_texts(a, monkeypatch)
+    assert "IMAGEN" in texts
+    assert "VÍDEO" not in texts
+    assert not any(t.startswith("Esp pausa") for t in texts)
+
+
+def test_panel_with_video_section(make_video_app, monkeypatch):
+    a = make_video_app()
+    texts = _panel_texts(a, monkeypatch)
+    assert "VÍDEO" in texts and "IMAGEN" not in texts
+    assert any("frame 0/10" in t for t in texts)
+
+
+def test_release_closes_source_before_gl_and_terminate(make_video_app, monkeypatch):
+    a = make_video_app()
+    log = a.source.log
+    a._resources = [Spy("quad", log), Spy("processor", log)]
+    a.ctx = Spy("ctx", log)
+    a.window = "ventana"
+    monkeypatch.setattr(app_mod.glfw, "destroy_window", lambda w: log.append("destroy_window"))
+    monkeypatch.setattr(app_mod.glfw, "terminate", lambda: log.append("terminate"))
+    a.release()
+    assert log == ["source.close", "processor", "quad", "ctx", "destroy_window", "terminate"]
+    assert a.source is None and a.ctx is None and a.window is None and a._resources == []
+
+
+def test_release_warns_when_close_raises_and_frees_everything(make_video_app, monkeypatch, capsys):
+    a = make_video_app(close_error=OSError("ffmpeg colgado"))
+    log = a.source.log
+    a._resources = [Spy("quad", log)]
+    a.ctx = Spy("ctx", log)
+    a.window = "ventana"
+    monkeypatch.setattr(app_mod.glfw, "destroy_window", lambda w: log.append("destroy_window"))
+    monkeypatch.setattr(app_mod.glfw, "terminate", lambda: log.append("terminate"))
+    a.release()  # no relanza (R12.7)
+    assert log == ["source.close", "quad", "ctx", "destroy_window", "terminate"]
+    err = capsys.readouterr().err
+    assert "Aviso:" in err and "ffmpeg colgado" in err
+    assert a.source is None
+
+
+def test_capture_keeps_playing_and_index(make_video_app, tmp_path, monkeypatch):
+    a = make_video_app(n_frames=100)
+    a.player.shown_index = 12
+    clock = a.player.clock
+    before = (clock.playing, clock.loop, clock.t0, clock.anchor)
+    runs = []
+
+    class Proc:
+        def run(self, state):
+            runs.append(state)
+            return "tex", "view"
+
+    a.processor = Proc()
+    a.ctx = a.quad = a.prog_display = None
+    w, h = a.size
+    monkeypatch.setattr(app_mod.capture, "render_display", lambda *args: np.zeros((h, w, 3), np.uint8))
+    a.results_dir = tmp_path / "results"
+    a.apply_key(st.KEY_G)
+    files = list(a.results_dir.glob("*.png"))
+    assert len(files) == 1 and files[0].name.endswith("_f00012.png")
+    assert (clock.playing, clock.loop, clock.t0, clock.anchor) == before  # sin pausar (R10.4)
+    assert a.player.shown_index == 12  # sin cambiar el índice (R10.5)
+    assert len(runs) == 1
